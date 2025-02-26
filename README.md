@@ -62,16 +62,14 @@ python manage.py migrate
 Run the development server:
 python manage.py runserver
 
-Configuration
+# Configuration
 Edit config.yaml to set DCF model parameters:
 Forecast period (default: 10 years)
 Terminal growth rate (default: 2.5%)
 Discount rate methodology (WACC or custom)
 Historical data lookback period
 
-
-
-Basic Analysis
+# Basic Analysis
 pythonCopyfrom dcf_analyzer import StockAnalyzer
 
 Initialize analyzer for a single company:
