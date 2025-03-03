@@ -1,0 +1,2802 @@
+# First model with a full implementation.
+
+# Output returned is commmented out at bottom.
+
+
+import yfinance as yf
+import numpy as np
+import pandas as pd
+import requests
+import time
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')  # Suppress warnings for cleaner output
+
+# new imports for new iteration of the growth rate calculation
+import traceback
+import re
+from datetime import datetime, timedelta
+
+
+# Company info
+
+# Example ticket for Apple Inc.
+# ticker = "AAPL"
+# company_cik = "0000320193"  # Apple's CIK with leading zeros
+
+test_stocks = [("AAPL", "0000320193"), ("MSFT", "0000789019"), ("AMZN", "0001018724"), ("GOOGL", "0001652044"),  ("TSLA", "0001318605"), ("FB", "0001326801"), ("NVDA", "0001045810"), ("PYPL", "0001633917"), ("ADBE", "0000796343"), ("NFLX", "0001065280")]
+
+for stock in test_stocks:
+    ticker = stock[0]
+    company_cik = stock[1]
+        
+    # SEC API Base URLs
+    SEC_SUBMISSION_BASE = "https://data.sec.gov/submissions/CIK{}.json"
+    SEC_COMPANY_CONCEPT = "https://data.sec.gov/api/xbrl/companyconcept/CIK{}/us-gaap/{}.json"
+
+    # Headers required by SEC
+    headers = {
+        'User-Agent': 'Daniel Lopez dlopezkluever@gmail.com',
+        'Accept-Encoding': 'gzip, deflate',
+        'Host': 'data.sec.gov'
+    }
+
+    def get_company_facts(cik, concept):
+        """Get specific financial concept data from SEC API"""
+        # Ensure CIK is 10 digits with leading zeros
+        cik = cik.lstrip('0')
+        cik_padded = cik.zfill(10)
+        
+        url = SEC_COMPANY_CONCEPT.format(cik_padded, concept)
+        
+        try:
+            response = requests.get(url, headers=headers)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                print(f"Error fetching {concept} data: Status {response.status_code}")
+                return None
+        except Exception as e:
+            print(f"Exception while fetching {concept}: {e}")
+            return None
+
+
+    def get_financial_data(ticker, cik=None, retry_count=3):
+        """
+        Fetch the latest financial data with multiple retry attempts and better error handling.
+        
+        Args:
+            ticker (str): Stock ticker symbol
+            cik (str): Company's CIK number (optional)
+            retry_count (int): Number of retry attempts
+        
+        Returns:
+            dict: Financial data or None if data cannot be retrieved
+        """
+        print(f"\nFetching financial data for {ticker}...")
+        
+        for attempt in range(retry_count):
+            try:
+                stock = yf.Ticker(ticker)
+                
+                # Get cash flow statements with fallback options
+                cash_flow = None
+                try:
+                    cash_flow = stock.cashflow
+                    if cash_flow.empty:
+                        print("Primary cash flow data empty, trying quarterly...")
+                        quarterly_cf = stock.quarterly_cashflow
+                        if not quarterly_cf.empty:
+                            # Convert quarterly to annual by summing the most recent 4 quarters
+                            cash_flow = quarterly_cf.iloc[:, :4].sum(axis=1).to_frame()
+                except Exception as e:
+                    print(f"Error fetching cash flow: {e}")
+                
+                if cash_flow is None or cash_flow.empty:
+                    print("Could not retrieve cash flow data")
+                    if attempt < retry_count - 1:
+                        print(f"Retrying ({attempt + 1}/{retry_count})...")
+                        time.sleep(2)  # Wait before retrying
+                        continue
+                    return None
+                
+                # Calculate Free Cash Flow
+                if 'Free Cash Flow' in cash_flow.index:
+                    free_cash_flow = cash_flow.loc['Free Cash Flow'].iloc[0]
+                elif all(item in cash_flow.index for item in ['Operating Cash Flow', 'Capital Expenditure']):
+                    operating_cash_flow = cash_flow.loc['Operating Cash Flow'].iloc[0]
+                    capital_expenditure = cash_flow.loc['Capital Expenditure'].iloc[0]
+                    free_cash_flow = operating_cash_flow + capital_expenditure  # CapEx is negative
+                else:
+                    print(f"Cannot calculate FCF: missing required components")
+                    return None
+                
+                # Get shares outstanding with multiple fallback methods
+                shares_outstanding = None
+                
+                # Method 1: From info
+                try:
+                    shares_outstanding = stock.info.get('sharesOutstanding')
+                except:
+                    print("Could not get shares outstanding from info")
+                
+                # Method 2: From quarterly data
+                if shares_outstanding is None or np.isnan(shares_outstanding):
+                    try:
+                        bal_sheet = stock.balance_sheet
+                        if 'Common Stock' in bal_sheet.index:
+                            # This is not perfect as it's the book value not share count
+                            # but can be used as a last resort with price adjustment
+                            common_stock = bal_sheet.loc['Common Stock'].iloc[0]
+                            last_price = stock.history(period="1d")["Close"].iloc[-1]
+                            # Estimate based on typical par values
+                            if last_price > 0:
+                                shares_outstanding = common_stock / (0.01)  # Assuming $0.01 par value
+                        elif 'Share Issued' in bal_sheet.index:
+                            shares_outstanding = bal_sheet.loc['Share Issued'].iloc[0]
+                    except:
+                        print("Could not calculate shares outstanding from balance sheet")
+                
+                # Method 3: Use market cap / price
+                if shares_outstanding is None or np.isnan(shares_outstanding):
+                    try:
+                        market_cap = stock.info.get('marketCap')
+                        last_price = stock.history(period="1d")["Close"].iloc[-1]
+                        if market_cap and last_price and last_price > 0:
+                            shares_outstanding = market_cap / last_price
+                    except:
+                        print("Could not calculate shares outstanding from market cap")
+                
+                if shares_outstanding is None or np.isnan(shares_outstanding):
+                    print(f"Could not determine shares outstanding for {ticker}")
+                    return None
+                
+                # Get current price
+                try:
+                    current_price = stock.history(period="1d")["Close"].iloc[-1]
+                except:
+                    print(f"Could not fetch current price for {ticker}")
+                    return None
+                
+                return {
+                    'free_cash_flow': free_cash_flow,
+                    'shares_outstanding': shares_outstanding,
+                    'current_price': current_price,
+                    'cash_flow': cash_flow,
+                    'ticker': ticker,
+                    'stock': stock
+                }
+            
+            except Exception as e:
+                print(f"Attempt {attempt + 1} failed: {e}")
+                if attempt < retry_count - 1:
+                    print(f"Retrying in 2 seconds...")
+                    time.sleep(2)
+                else:
+                    print(f"All {retry_count} attempts failed for {ticker}")
+                    return None
+    
+    #############################################################################################################################
+    #-------------------------------- DCF Analysis (Formerly indomestic_rate_estimator.py file) --------------------------------#
+    #############################################################################################################################
+    #--------------------------------- Discount Rate (WACC) Calculation -----------------------------------#
+    ########################################################################################################
+    
+    
+    def calculate_wacc(ticker, financial_data=None):
+        """
+        Calculate WACC with improved error handling, data validation and additional data sources.
+        
+        Args:
+            ticker (str): Stock ticker symbol
+            financial_data (dict): Financial data if already fetched
+        
+        Returns:
+            dict: WACC components and final value
+        """
+        print(f"Calculating WACC for {ticker}...")
+        
+        try:
+            if financial_data and 'stock' in financial_data:
+                stock = financial_data['stock']
+            else:
+                stock = yf.Ticker(ticker)
+            
+            # Get balance sheet and financials with expanded timeframes
+            try:
+                # Try to get data for longer periods to increase chances of getting data
+                balance_sheet = stock.balance_sheet
+                financials = stock.financials
+                income_statement = stock.income_stmt  # Get income statement explicitly
+                cash_flow = stock.cashflow  # Get cash flow statement explicitly
+                
+                # Fallback to quarterly data if annual is empty
+                if balance_sheet.empty or len(balance_sheet.columns) == 0:
+                    balance_sheet = stock.quarterly_balance_sheet
+                    if not balance_sheet.empty and len(balance_sheet.columns) > 0:
+                        print("Using latest quarterly balance sheet")
+                
+                if financials.empty or len(financials.columns) == 0:
+                    financials = stock.quarterly_financials
+                    if not financials.empty and len(financials.columns) > 0:
+                        print("Using latest quarterly financials")
+                        
+                if income_statement is None or (hasattr(income_statement, 'empty') and income_statement.empty):
+                    income_statement = stock.quarterly_income_stmt
+                    
+                if cash_flow is None or (hasattr(cash_flow, 'empty') and cash_flow.empty):
+                    cash_flow = stock.quarterly_cashflow
+                    
+            except Exception as e:
+                print(f"Error getting financial statements: {e}")
+                return default_wacc_values(ticker)
+            
+            # Validate that we have the necessary data
+            if ((balance_sheet is None or hasattr(balance_sheet, 'empty') and balance_sheet.empty) and 
+                (financials is None or hasattr(financials, 'empty') and financials.empty)):
+                print("Missing required financial statements")
+                return default_wacc_values(ticker)
+            
+            # Calculate total debt with improved robustness
+            total_debt = 0
+            debt_items = ['Total Debt', 'Long Term Debt', 'Short Long Term Debt', 
+                        'Current Debt', 'Short Term Debt', 'Current Long Term Debt']
+            
+            # Check if balance sheet is available and not empty
+            if balance_sheet is not None and not (hasattr(balance_sheet, 'empty') and balance_sheet.empty):
+                for item in debt_items:
+                    if item in balance_sheet.index:
+                        debt_value = balance_sheet.loc[item].iloc[0]
+                        if not pd.isna(debt_value) and not np.isnan(debt_value):
+                            total_debt += debt_value
+            
+            # If no debt items found in balance sheet, try to get from info
+            if total_debt == 0:
+                try:
+                    total_debt = stock.info.get('totalDebt', 0)
+                    if pd.isna(total_debt) or np.isnan(total_debt):
+                        total_debt = 0
+                except:
+                    pass
+                    
+            # If still no debt, try alternative fields
+            if total_debt == 0:
+                try:
+                    # Sometimes available under different keys
+                    for field in ['longTermDebt', 'shortTermDebt', 'totalDebt']:
+                        if field in stock.info:
+                            value = stock.info.get(field, 0)
+                            if value and not pd.isna(value) and not np.isnan(value):
+                                total_debt += value
+                except:
+                    pass
+            
+            # Get Market Cap (Equity Value) with multiple methods
+            market_cap = None
+            try:
+                market_cap = stock.info.get('marketCap')
+                if pd.isna(market_cap) or np.isnan(market_cap):
+                    market_cap = None
+            except:
+                pass
+            
+            if market_cap is None:
+                try:
+                    # Try to get from info dict with multiple keys
+                    for field in ['marketCapitalization', 'enterpriseValue']:
+                        val = stock.info.get(field)
+                        if val and not pd.isna(val) and not np.isnan(val):
+                            market_cap = val
+                            break
+                except:
+                    pass
+            
+            if market_cap is None:
+                try:
+                    # Estimate from shares outstanding and price
+                    shares = stock.info.get('sharesOutstanding')
+                    price = stock.history(period="1d")["Close"].iloc[-1]
+                    if shares and price and not pd.isna(shares) and not np.isnan(shares):
+                        market_cap = shares * price
+                except:
+                    pass
+                    
+            # Try to estimate market cap from financial statements if still not available
+            if market_cap is None:
+                try:
+                    if 'Common Stock' in balance_sheet.index:
+                        shares = balance_sheet.loc['Common Stock'].iloc[0]
+                        price = stock.history(period="1d")["Close"].iloc[-1]
+                        if shares and price:
+                            market_cap = shares * price
+                except:
+                    pass
+            
+            if market_cap is None or np.isnan(market_cap) or market_cap == 0:
+                print("Could not determine market cap, using industry average values")
+                return default_wacc_values(ticker, get_industry_average=True)
+            
+            # Total Capital = Debt + Equity
+            total_capital = total_debt + market_cap
+            
+            # Weight of Debt and Equity (with validation)
+            weight_debt = total_debt / total_capital if total_capital > 0 else 0
+            weight_equity = market_cap / total_capital if total_capital > 0 else 1
+            
+            # Validate weights sum to 1
+            if abs(weight_debt + weight_equity - 1.0) > 0.01:
+                weight_sum = weight_debt + weight_equity
+                if weight_sum > 0:  # Prevent division by zero
+                    weight_debt = weight_debt / weight_sum
+                    weight_equity = weight_equity / weight_sum
+                else:
+                    weight_debt = 0
+                    weight_equity = 1
+            
+            # Cost of Debt calculation with multiple methods
+            cost_of_debt = None
+            
+            # Method 1: Calculate from interest expense and total debt
+            if financials is not None and not financials.empty and 'Interest Expense' in financials.index and total_debt > 0:
+                interest_expense = abs(financials.loc['Interest Expense'].iloc[0])
+                if not pd.isna(interest_expense) and not np.isnan(interest_expense):
+                    calculated_cod = interest_expense / total_debt
+                    
+                    # Validate the calculated cost of debt is reasonable
+                    if 0.01 <= calculated_cod <= 0.15:
+                        cost_of_debt = calculated_cod
+                    else:
+                        print(f"Calculated cost of debt {calculated_cod:.2%} seems unreasonable")
+            
+            # Method 2: Calculate from interest coverage ratio
+            if cost_of_debt is None and income_statement is not None and not (hasattr(income_statement, 'empty') and income_statement.empty):
+                try:
+                    ebit_fields = ['EBIT', 'Operating Income', 'Income Before Tax']
+                    ebit = None
+                    
+                    for field in ebit_fields:
+                        if field in income_statement.index:
+                            ebit_val = income_statement.loc[field].iloc[0]
+                            if not pd.isna(ebit_val) and not np.isnan(ebit_val):
+                                ebit = ebit_val
+                                break
+                    
+                    if ebit is not None and financials is not None and 'Interest Expense' in financials.index:
+                        interest_expense = abs(financials.loc['Interest Expense'].iloc[0])
+                        if not pd.isna(interest_expense) and not np.isnan(interest_expense) and interest_expense > 0:
+                            interest_coverage = ebit / interest_expense
+                            
+                            # Estimate cost of debt based on interest coverage ratio
+                            if interest_coverage > 8.5:
+                                cost_of_debt = 0.04  # AAA/AA rating
+                            elif interest_coverage > 6.5:
+                                cost_of_debt = 0.045  # A rating
+                            elif interest_coverage > 5.5:
+                                cost_of_debt = 0.05  # BBB rating
+                            elif interest_coverage > 4:
+                                cost_of_debt = 0.055  # BB rating
+                            elif interest_coverage > 3:
+                                cost_of_debt = 0.065  # B rating
+                            elif interest_coverage > 2:
+                                cost_of_debt = 0.08  # CCC rating
+                            elif interest_coverage > 1:
+                                cost_of_debt = 0.10  # CC rating
+                            else:
+                                cost_of_debt = 0.12  # C/D rating
+                except Exception as e:
+                    print(f"Error calculating cost of debt from interest coverage: {e}")
+                    
+            # Method 3: Use leverage ratio to estimate based on risk
+            if cost_of_debt is None:
+                try:
+                    # Approximate based on leverage and company size
+                    debt_to_capital = total_debt / total_capital if total_capital > 0 else 0
+                    risk_free_rate = 0.042  # 10-year Treasury yield
+                    
+                    if market_cap > 200e9:  # Large cap
+                        size_premium = 0.01
+                    elif market_cap > 10e9:  # Mid cap
+                        size_premium = 0.02
+                    else:  # Small cap
+                        size_premium = 0.03
+                        
+                    if debt_to_capital > 0.6:  # High debt ratio
+                        leverage_premium = 0.03
+                    elif debt_to_capital > 0.3:  # Medium debt ratio
+                        leverage_premium = 0.02
+                    else:  # Low debt ratio
+                        leverage_premium = 0.01
+                        
+                    cost_of_debt = risk_free_rate + size_premium + leverage_premium
+                except:
+                    pass
+            
+            # Fallback
+            if cost_of_debt is None or pd.isna(cost_of_debt) or np.isnan(cost_of_debt):
+                print("Using default cost of debt")
+                cost_of_debt = 0.045
+            
+            # Tax Rate calculation with additional methods
+            tax_rate = None
+            
+            # Method 1: Calculate from income statements directly
+            if income_statement is not None and not (hasattr(income_statement, 'empty') and income_statement.empty):
+                try:
+                    if all(item in income_statement.index for item in ['Income Before Tax', 'Income Tax Expense']):
+                        income_before_tax = income_statement.loc['Income Before Tax'].iloc[0]
+                        income_tax_expense = income_statement.loc['Income Tax Expense'].iloc[0]
+                        
+                        if (income_before_tax > 0 and income_tax_expense > 0 and 
+                            not pd.isna(income_before_tax) and not np.isnan(income_before_tax) and
+                            not pd.isna(income_tax_expense) and not np.isnan(income_tax_expense)):
+                            calculated_tax_rate = income_tax_expense / income_before_tax
+                            # Validate the tax rate is reasonable
+                            if 0.1 <= calculated_tax_rate <= 0.4:
+                                tax_rate = calculated_tax_rate
+                except Exception as e:
+                    print(f"Error calculating tax rate from income statement: {e}")
+            
+            # Method 2: Calculate from financials if income statement failed
+            if tax_rate is None and financials is not None and not financials.empty:
+                try:
+                    if all(item in financials.index for item in ['Income Before Tax', 'Income Tax Expense']):
+                        income_before_tax = financials.loc['Income Before Tax'].iloc[0]
+                        income_tax_expense = financials.loc['Income Tax Expense'].iloc[0]
+                        
+                        if (income_before_tax > 0 and income_tax_expense > 0 and 
+                            not pd.isna(income_before_tax) and not np.isnan(income_before_tax) and
+                            not pd.isna(income_tax_expense) and not np.isnan(income_tax_expense)):
+                            calculated_tax_rate = income_tax_expense / income_before_tax
+                            # Validate the tax rate is reasonable
+                            if 0.1 <= calculated_tax_rate <= 0.4:
+                                tax_rate = calculated_tax_rate
+                except:
+                    pass
+            
+            # Method 3: Use effective tax rate from company info
+            if tax_rate is None:
+                try:
+                    if 'effectiveTaxRate' in stock.info:
+                        effective_tax_rate = stock.info.get('effectiveTaxRate')
+                        if effective_tax_rate and 0.1 <= effective_tax_rate <= 0.4:
+                            tax_rate = effective_tax_rate
+                except:
+                    pass
+                    
+            # Method 4: Calculate average from historical data
+            if tax_rate is None:
+                try:
+                    if (income_statement is not None and not (hasattr(income_statement, 'empty') and income_statement.empty) and
+                        'Income Before Tax' in income_statement.index and 'Income Tax Expense' in income_statement.index):
+                        # Calculate tax rates for all available periods
+                        income_before_tax = income_statement.loc['Income Before Tax']
+                        income_tax_expense = income_statement.loc['Income Tax Expense']
+                        
+                        tax_rates = []
+                        for i in range(len(income_before_tax)):
+                            if (i < len(income_tax_expense) and income_before_tax.iloc[i] > 0 and 
+                                not pd.isna(income_before_tax.iloc[i]) and not np.isnan(income_before_tax.iloc[i]) and
+                                not pd.isna(income_tax_expense.iloc[i]) and not np.isnan(income_tax_expense.iloc[i])):
+                                rate = income_tax_expense.iloc[i] / income_before_tax.iloc[i]
+                                if 0.1 <= rate <= 0.4:  # Validate the rate
+                                    tax_rates.append(rate)
+                        
+                        if tax_rates:
+                            tax_rate = sum(tax_rates) / len(tax_rates)
+                except Exception as e:
+                    print(f"Error calculating average tax rate: {e}")
+            
+            # Fallback to standard corporate tax rate
+            if tax_rate is None or pd.isna(tax_rate) or np.isnan(tax_rate):
+                print("Using standard corporate tax rate")
+                tax_rate = 0.21  # US corporate tax rate
+            
+            # After-tax Cost of Debt
+            after_tax_cost_of_debt = cost_of_debt * (1 - tax_rate)
+            
+            # Cost of Equity using CAPM
+            risk_free_rate = 0.042  # Update this based on current 10-year Treasury yield
+            market_risk_premium = 0.05  # Historical equity risk premium
+            
+            # Get beta with validation and multiple methods
+            beta = None
+            try:
+                beta = stock.info.get('beta')
+                if pd.isna(beta) or np.isnan(beta):
+                    beta = None
+            except:
+                pass
+            
+            # Validate beta or use alternative methods
+            if beta is None or beta < 0.2 or beta > 3.0:
+                print("Beta missing or unreasonable, estimating based on sector")
+                try:
+                    # Method 1: Try to get sector from info
+                    sector = None
+                    try:
+                        sector = stock.info.get('sector')
+                    except:
+                        pass
+                    
+                    # Method 2: Try to get industry if sector failed
+                    if not sector:
+                        try:
+                            industry = stock.info.get('industry')
+                            # Map industry to sector
+                            industry_to_sector = {
+                                'Internet Content': 'Technology',
+                                'Software': 'Technology',
+                                'Consumer Electronics': 'Technology',
+                                'Computer Hardware': 'Technology',
+                                'Online Retail': 'Consumer Cyclical',
+                                'Auto Manufacturers': 'Consumer Cyclical',
+                                # Add more mappings as needed
+                            }
+                            sector = industry_to_sector.get(industry)
+                        except:
+                            pass
+                    
+                    # Approximate beta by sector
+                    sector_betas = {
+                        'Technology': 1.2,
+                        'Financial Services': 1.1,
+                        'Healthcare': 0.9,
+                        'Consumer Cyclical': 1.3,
+                        'Communication Services': 1.0,
+                        'Industrials': 1.1,
+                        'Consumer Defensive': 0.7,
+                        'Energy': 1.3,
+                        'Basic Materials': 1.2,
+                        'Real Estate': 0.8,
+                        'Utilities': 0.5
+                    }
+                    
+                    if sector and sector in sector_betas:
+                        beta = sector_betas[sector]
+                    else:
+                        # Method 3: Estimate based on volatility relative to market
+                        try:
+                            # Get stock price history
+                            stock_history = stock.history(period="1y")
+                            
+                            # Get market index (S&P 500) history
+                            market = yf.Ticker("^GSPC")
+                            market_history = market.history(period="1y")
+                            
+                            # Calculate returns
+                            stock_returns = stock_history['Close'].pct_change().dropna()
+                            market_returns = market_history['Close'].pct_change().dropna()
+                            
+                            # Make sure they have the same length
+                            min_len = min(len(stock_returns), len(market_returns))
+                            if min_len > 30:  # Ensure we have enough data points
+                                stock_returns = stock_returns[-min_len:]
+                                market_returns = market_returns[-min_len:]
+                                
+                                # Calculate covariance and variance
+                                covariance = np.cov(stock_returns, market_returns)[0, 1]
+                                market_variance = np.var(market_returns)
+                                
+                                # Calculate beta
+                                calculated_beta = covariance / market_variance
+                                
+                                # Validate beta is reasonable
+                                if 0.2 <= calculated_beta <= 3.0:
+                                    beta = calculated_beta
+                        except Exception as e:
+                            print(f"Error calculating beta from historical data: {e}")
+                except:
+                    pass
+                    
+                # Fallback if all methods fail
+                if beta is None:
+                    beta = 1.0
+            
+            # Calculate Cost of Equity
+            cost_of_equity = risk_free_rate + beta * market_risk_premium
+            
+            # WACC Calculation
+            wacc = (weight_debt * after_tax_cost_of_debt) + (weight_equity * cost_of_equity)
+            
+            # Validate final WACC
+            if np.isnan(wacc) or pd.isna(wacc) or not (0.05 <= wacc <= 0.20):
+                print(f"WACC calculation resulted in unusual value: {wacc}, adjusting...")
+                # Use sector as a guide for realistic WACC
+                try:
+                    sector = stock.info.get('sector')
+                    if sector:
+                        # Sector-specific baseline WACC values
+                        sector_base_wacc = {
+                            'Technology': 0.09,
+                            'Financial Services': 0.08,
+                            'Healthcare': 0.075,
+                            'Consumer Cyclical': 0.085,
+                            'Communication Services': 0.08,
+                            'Industrials': 0.085,
+                            'Consumer Defensive': 0.07,
+                            'Energy': 0.095,
+                            'Basic Materials': 0.085,
+                            'Real Estate': 0.075,
+                            'Utilities': 0.065
+                        }
+                        base_wacc = sector_base_wacc.get(sector, 0.085)
+                        # Adjust based on beta if available
+                        if beta and not np.isnan(beta) and not pd.isna(beta):
+                            wacc = base_wacc + (beta - 1) * 0.01
+                        else:
+                            wacc = base_wacc
+                    else:
+                        wacc = 0.085
+                except:
+                    wacc = 0.085
+                
+                # Ensure WACC is within reasonable bounds
+                wacc = min(max(wacc, 0.05), 0.20)
+            
+            return {
+                'wacc': wacc,
+                'cost_of_equity': cost_of_equity,
+                'after_tax_cost_of_debt': after_tax_cost_of_debt,
+                'weight_debt': weight_debt,
+                'weight_equity': weight_equity,
+                'beta': beta,
+                'tax_rate': tax_rate,
+                'total_debt': total_debt,
+                'market_cap': market_cap
+            }
+            
+        except Exception as e:
+            print(f"Error calculating WACC: {e}")
+            traceback_str = traceback.format_exc()
+            print(f"Traceback: {traceback_str}")
+            return default_wacc_values(ticker)
+    
+    def default_wacc_values(ticker, get_industry_average=False):
+        """
+        Provide default WACC values based on industry averages if possible.
+        
+        Args:
+            ticker (str): Stock ticker symbol
+            get_industry_average (bool): Whether to attempt to get industry averages
+        
+        Returns:
+            dict: Default WACC components
+        """
+        print("Using default WACC values")
+        
+        if get_industry_average:
+            try:
+                stock = yf.Ticker(ticker)
+                
+                # Try multiple ways to get sector information
+                sector = None
+                industry = None
+                
+                try:
+                    sector = stock.info.get('sector')
+                    industry = stock.info.get('industry')
+                except:
+                    pass
+                    
+                # If sector not found, try to get from alternative sources
+                if not sector:
+                    try:
+                        # You could expand this with additional data sources
+                        # For example, a mapping of tickers to sectors
+                        ticker_to_sector = {
+                            'AAPL': 'Technology',
+                            'MSFT': 'Technology',
+                            'AMZN': 'Consumer Cyclical',
+                            'GOOGL': 'Communication Services',
+                            'TSLA': 'Consumer Cyclical',
+                            # Add more mappings for common tickers
+                        }
+                        sector = ticker_to_sector.get(ticker)
+                    except:
+                        pass
+                
+                # Expanded sector-specific WACC values with more detail
+                sector_waccs = {
+                    'Technology': {
+                        'wacc': 0.095,
+                        'cost_of_equity': 0.11,
+                        'after_tax_cost_of_debt': 0.035,
+                        'weight_debt': 0.15,
+                        'weight_equity': 0.85,
+                        'beta': 1.2,
+                        'tax_rate': 0.21
+                    },
+                    'Financial Services': {
+                        'wacc': 0.085,
+                        'cost_of_equity': 0.095,
+                        'after_tax_cost_of_debt': 0.025,
+                        'weight_debt': 0.40,
+                        'weight_equity': 0.60,
+                        'beta': 1.1,
+                        'tax_rate': 0.21
+                    },
+                    'Healthcare': {
+                        'wacc': 0.08,
+                        'cost_of_equity': 0.09,
+                        'after_tax_cost_of_debt': 0.035,
+                        'weight_debt': 0.20,
+                        'weight_equity': 0.80,
+                        'beta': 0.9,
+                        'tax_rate': 0.21
+                    },
+                    'Consumer Cyclical': {
+                        'wacc': 0.09,
+                        'cost_of_equity': 0.105,
+                        'after_tax_cost_of_debt': 0.04,
+                        'weight_debt': 0.25,
+                        'weight_equity': 0.75,
+                        'beta': 1.3,
+                        'tax_rate': 0.21
+                    },
+                    'Communication Services': {
+                        'wacc': 0.085,
+                        'cost_of_equity': 0.095,
+                        'after_tax_cost_of_debt': 0.035,
+                        'weight_debt': 0.30,
+                        'weight_equity': 0.70,
+                        'beta': 1.0,
+                        'tax_rate': 0.21
+                    },
+                    'Industrials': {
+                        'wacc': 0.09,
+                        'cost_of_equity': 0.10,
+                        'after_tax_cost_of_debt': 0.035,
+                        'weight_debt': 0.30,
+                        'weight_equity': 0.70,
+                        'beta': 1.1,
+                        'tax_rate': 0.21
+                    },
+                    'Consumer Defensive': {
+                        'wacc': 0.07,
+                        'cost_of_equity': 0.075,
+                        'after_tax_cost_of_debt': 0.03,
+                        'weight_debt': 0.35,
+                        'weight_equity': 0.65,
+                        'beta': 0.7,
+                        'tax_rate': 0.21
+                    },
+                    'Energy': {
+                        'wacc': 0.10,
+                        'cost_of_equity': 0.115,
+                        'after_tax_cost_of_debt': 0.045,
+                        'weight_debt': 0.35,
+                        'weight_equity': 0.65,
+                        'beta': 1.3,
+                        'tax_rate': 0.21
+                    },
+                    'Basic Materials': {
+                        'wacc': 0.09,
+                        'cost_of_equity': 0.105,
+                        'after_tax_cost_of_debt': 0.04,
+                        'weight_debt': 0.30,
+                        'weight_equity': 0.70,
+                        'beta': 1.2,
+                        'tax_rate': 0.21
+                    },
+                    'Real Estate': {
+                        'wacc': 0.08,
+                        'cost_of_equity': 0.085,
+                        'after_tax_cost_of_debt': 0.035,
+                        'weight_debt': 0.60,
+                        'weight_equity': 0.40,
+                        'beta': 0.8,
+                        'tax_rate': 0.21
+                    },
+                    'Utilities': {
+                        'wacc': 0.07,
+                        'cost_of_equity': 0.075,
+                        'after_tax_cost_of_debt': 0.03,
+                        'weight_debt': 0.55,
+                        'weight_equity': 0.45,
+                        'beta': 0.5,
+                        'tax_rate': 0.21
+                    }
+                }
+                
+                # More specific industry adjustments for certain industries
+                industry_adjustments = {
+                    'Software—Application': {'wacc_adj': 0.01, 'beta_adj': 0.1},
+                    'Semiconductor': {'wacc_adj': 0.005, 'beta_adj': 0.1},
+                    'Internet Retail': {'wacc_adj': 0.01, 'beta_adj': 0.2},
+                    'Auto Manufacturers': {'wacc_adj': 0.01, 'beta_adj': 0.2},
+                    'Oil & Gas E&P': {'wacc_adj': 0.02, 'beta_adj': 0.2},
+                }
+                
+                # Get base values from sector
+                if sector in sector_waccs:
+                    values = sector_waccs[sector].copy()
+                    
+                    # Apply industry-specific adjustments if available
+                    if industry in industry_adjustments:
+                        adj = industry_adjustments[industry]
+                        values['wacc'] += adj.get('wacc_adj', 0)
+                        values['beta'] += adj.get('beta_adj', 0)
+                        values['cost_of_equity'] += adj.get('wacc_adj', 0) * 1.2  # Scale adjustment for CoE
+                    
+                    # Try to get beta from stock data if available
+                    try:
+                        beta = stock.info.get('beta')
+                        if beta and not np.isnan(beta) and not pd.isna(beta) and 0.2 <= beta <= 3.0:
+                            values['beta'] = beta
+                            # Adjust cost of equity based on actual beta
+                            risk_free_rate = 0.042
+                            market_risk_premium = 0.05
+                            values['cost_of_equity'] = risk_free_rate + beta * market_risk_premium
+                    except:
+                        pass
+                        
+                    return values
+                    
+            except Exception as e:
+                print(f"Error getting industry-specific WACC values: {e}")
+        
+        # Generic default if industry lookup fails
+        # Default values ensure fallback to reasonable assumptions
+        return {
+            'wacc': 0.09,  # Default 9%
+            'cost_of_equity': 0.10,
+            'after_tax_cost_of_debt': 0.03,
+            'weight_debt': 0.2,
+            'weight_equity': 0.8,
+            'beta': 1.0,
+            'tax_rate': 0.21
+        }
+    
+    # The Discount Rate reflects the company's Weighted Average Cost of Capital (WACC):
+
+    # def calculate_wacc(ticker, financial_data=None):
+    #     """
+    #     Calculate WACC with improved error handling and data validation.
+        
+    #     Args:
+    #         ticker (str): Stock ticker symbol
+    #         financial_data (dict): Financial data if already fetched
+        
+    #     Returns:
+    #         dict: WACC components and final value
+    #     """
+    #     print(f"Calculating WACC for {ticker}...")
+        
+    #     try:
+    #         if financial_data and 'stock' in financial_data:
+    #             stock = financial_data['stock']
+    #         else:
+    #             stock = yf.Ticker(ticker)
+            
+    #         # Get balance sheet and financials
+    #         try:
+    #             balance_sheet = stock.balance_sheet
+    #             financials = stock.financials
+                
+    #             # Fallback to quarterly data if annual is empty
+    #             if balance_sheet.empty:
+    #                 balance_sheet = stock.quarterly_balance_sheet
+    #                 if not balance_sheet.empty:
+    #                     print("Using latest quarterly balance sheet")
+                
+    #             if financials.empty:
+    #                 financials = stock.quarterly_financials
+    #                 if not financials.empty:
+    #                     print("Using latest quarterly financials")
+    #         except Exception as e:
+    #             print(f"Error getting financial statements: {e}")
+    #             return default_wacc_values(ticker)
+            
+    #         # Validate that we have the necessary data
+    #         if balance_sheet.empty or financials.empty:
+    #             print("Missing required financial statements")
+    #             return default_wacc_values(ticker)
+            
+    #         # Calculate total debt with improved robustness
+    #         total_debt = 0
+    #         debt_items = ['Total Debt', 'Long Term Debt', 'Short Long Term Debt', 
+    #                     'Current Debt', 'Short Term Debt', 'Current Long Term Debt']
+            
+    #         for item in debt_items:
+    #             if item in balance_sheet.index:
+    #                 debt_value = balance_sheet.loc[item].iloc[0]
+    #                 if not np.isnan(debt_value):
+    #                     total_debt += debt_value
+            
+    #         # If no debt items found, try to get from info
+    #         if total_debt == 0:
+    #             try:
+    #                 total_debt = stock.info.get('totalDebt', 0)
+    #             except:
+    #                 pass
+            
+    #         # Get Market Cap (Equity Value) with multiple methods
+    #         market_cap = None
+    #         try:
+    #             market_cap = stock.info.get('marketCap')
+    #         except:
+    #             pass
+            
+    #         if market_cap is None or np.isnan(market_cap):
+    #             try:
+    #                 # Estimate from shares outstanding and price
+    #                 shares = stock.info.get('sharesOutstanding')
+    #                 price = stock.history(period="1d")["Close"].iloc[-1]
+    #                 if shares and price:
+    #                     market_cap = shares * price
+    #             except:
+    #                 pass
+            
+    #         if market_cap is None or np.isnan(market_cap) or market_cap == 0:
+    #             print("Could not determine market cap, using industry average values")
+    #             return default_wacc_values(ticker, get_industry_average=True)
+            
+    #         # Total Capital = Debt + Equity
+    #         total_capital = total_debt + market_cap
+            
+    #         # Weight of Debt and Equity (with validation)
+    #         weight_debt = total_debt / total_capital if total_capital > 0 else 0
+    #         weight_equity = market_cap / total_capital if total_capital > 0 else 1
+            
+    #         # Validate weights sum to 1
+    #         if abs(weight_debt + weight_equity - 1.0) > 0.01:
+    #             weight_debt = weight_debt / (weight_debt + weight_equity)
+    #             weight_equity = weight_equity / (weight_debt + weight_equity)
+            
+    #         # Cost of Debt calculation with multiple methods
+    #         cost_of_debt = None
+            
+    #         # Method 1: Calculate from interest expense and total debt
+    #         if 'Interest Expense' in financials.index and total_debt > 0:
+    #             interest_expense = abs(financials.loc['Interest Expense'].iloc[0])
+    #             calculated_cod = interest_expense / total_debt
+                
+    #             # Validate the calculated cost of debt is reasonable
+    #             if 0.01 <= calculated_cod <= 0.15:
+    #                 cost_of_debt = calculated_cod
+    #             else:
+    #                 print(f"Calculated cost of debt {calculated_cod:.2%} seems unreasonable")
+            
+    #         # Method 2: Try to get yield from recent bond issuances
+    #         if cost_of_debt is None:
+    #             # This would require an external API which is not implemented here
+    #             # Could use FINRA's TRACE data or similar
+    #             pass
+            
+    #         # Method 3: Use credit rating-based approximation
+    #         if cost_of_debt is None:
+    #             # Approximation based on typical bonds for similar companies
+    #             if total_debt / total_capital > 0.6:  # High debt ratio
+    #                 cost_of_debt = 0.07  # Higher rate for highly leveraged
+    #             elif total_debt / total_capital > 0.3:  # Medium debt ratio
+    #                 cost_of_debt = 0.055  # Medium rate
+    #             else:  # Low debt ratio
+    #                 cost_of_debt = 0.04  # Lower rate for less leveraged
+            
+    #         # Fallback
+    #         if cost_of_debt is None:
+    #             print("Using default cost of debt")
+    #             cost_of_debt = 0.045
+            
+    #         # Tax Rate calculation with validation
+    #         tax_rate = None
+            
+    #         # Method 1: Calculate from income statements
+    #         if all(item in financials.index for item in ['Income Before Tax', 'Income Tax Expense']):
+    #             income_before_tax = financials.loc['Income Before Tax'].iloc[0]
+    #             income_tax_expense = financials.loc['Income Tax Expense'].iloc[0]
+                
+    #             if income_before_tax > 0 and income_tax_expense > 0:
+    #                 calculated_tax_rate = income_tax_expense / income_before_tax
+    #                 # Validate the tax rate is reasonable
+    #                 if 0.1 <= calculated_tax_rate <= 0.4:
+    #                     tax_rate = calculated_tax_rate
+            
+    #         # Method 2: Try to get effective tax rate from earnings reports
+    #         if tax_rate is None:
+    #             try:
+    #                 # This could be implemented using an SEC filing API
+    #                 pass
+    #             except:
+    #                 pass
+            
+    #         # Fallback to standard corporate tax rate
+    #         if tax_rate is None:
+    #             print("Using standard corporate tax rate")
+    #             tax_rate = 0.21  # US corporate tax rate
+            
+    #         # After-tax Cost of Debt
+    #         after_tax_cost_of_debt = cost_of_debt * (1 - tax_rate)
+            
+    #         # Cost of Equity using CAPM
+    #         risk_free_rate = 0.042  # Update this based on current 10-year Treasury yield
+    #         market_risk_premium = 0.05  # Historical equity risk premium
+            
+    #         # Get beta with validation
+    #         beta = stock.info.get('beta')
+            
+    #         if beta is None or np.isnan(beta) or beta < 0.2 or beta > 3.0:
+    #             print("Beta missing or unreasonable, estimating based on sector")
+    #             try:
+    #                 sector = stock.info.get('sector')
+    #                 if sector:
+    #                     # Approximate beta by sector
+    #                     sector_betas = {
+    #                         'Technology': 1.2,
+    #                         'Financial Services': 1.1,
+    #                         'Healthcare': 0.9,
+    #                         'Consumer Cyclical': 1.3,
+    #                         'Communication Services': 1.0,
+    #                         'Industrials': 1.1,
+    #                         'Consumer Defensive': 0.7,
+    #                         'Energy': 1.3,
+    #                         'Basic Materials': 1.2,
+    #                         'Real Estate': 0.8,
+    #                         'Utilities': 0.5
+    #                     }
+    #                     beta = sector_betas.get(sector, 1.0)
+    #                 else:
+    #                     beta = 1.0
+    #             except:
+    #                 beta = 1.0
+            
+    #         # Calculate Cost of Equity
+    #         cost_of_equity = risk_free_rate + beta * market_risk_premium
+            
+    #         # WACC Calculation
+    #         wacc = (weight_debt * after_tax_cost_of_debt) + (weight_equity * cost_of_equity)
+            
+    #         # Validate final WACC
+    #         if np.isnan(wacc) or not (0.05 <= wacc <= 0.20):
+    #             print(f"WACC calculation resulted in unusual value: {wacc}, adjusting...")
+    #             wacc = min(max(0.07 + (beta - 1) * 0.02, 0.05), 0.20)
+            
+    #         return {
+    #             'wacc': wacc,
+    #             'cost_of_equity': cost_of_equity,
+    #             'after_tax_cost_of_debt': after_tax_cost_of_debt,
+    #             'weight_debt': weight_debt,
+    #             'weight_equity': weight_equity,
+    #             'beta': beta,
+    #             'tax_rate': tax_rate
+    #         }
+            
+    #     except Exception as e:
+    #         print(f"Error calculating WACC: {e}")
+    #         return default_wacc_values(ticker)
+
+    # def default_wacc_values(ticker, get_industry_average=False):
+    #     """
+    #     Provide default WACC values based on industry averages if possible.
+        
+    #     Args:
+    #         ticker (str): Stock ticker symbol
+    #         get_industry_average (bool): Whether to attempt to get industry averages
+        
+    #     Returns:
+    #         dict: Default WACC components
+    #     """
+    #     print("Using default WACC values")
+        
+    #     if get_industry_average:
+    #         try:
+    #             stock = yf.Ticker(ticker)
+    #             sector = stock.info.get('sector')
+    #             industry = stock.info.get('industry')
+                
+    #             # Approximate WACC by sector
+    #             sector_waccs = {
+    #                 'Technology': 0.095,
+    #                 'Financial Services': 0.085,
+    #                 'Healthcare': 0.08,
+    #                 'Consumer Cyclical': 0.09,
+    #                 'Communication Services': 0.085,
+    #                 'Industrials': 0.09,
+    #                 'Consumer Defensive': 0.07,
+    #                 'Energy': 0.10,
+    #                 'Basic Materials': 0.09,
+    #                 'Real Estate': 0.08,
+    #                 'Utilities': 0.07
+    #             }
+                
+    #             wacc = sector_waccs.get(sector, 0.09)
+    #             beta = stock.info.get('beta', 1.0)
+    #             if np.isnan(beta) or beta < 0.2 or beta > 3.0:
+    #                 beta = 1.0
+                    
+    #             return {
+    #                 'wacc': wacc,
+    #                 'cost_of_equity': wacc + 0.01,  # Slightly higher
+    #                 'after_tax_cost_of_debt': wacc - 0.03,  # Lower than WACC
+    #                 'weight_debt': 0.25,  # Industry average
+    #                 'weight_equity': 0.75,
+    #                 'beta': beta,
+    #                 'tax_rate': 0.21
+    #             }
+    #         except:
+    #             pass
+        
+    #     # Generic default if industry lookup fails
+    #     return {
+    #         'wacc': 0.09,  # Default 9%
+    #         'cost_of_equity': 0.10,
+    #         'after_tax_cost_of_debt': 0.03,
+    #         'weight_debt': 0.2,
+    #         'weight_equity': 0.8,
+    #         'beta': 1.0,
+    #         'tax_rate': 0.21
+    #     }
+
+    def fetch_revenue_data_safely(ticker, years=5):
+        """
+        A more robust function to fetch revenue data with multiple fallback methods
+        """
+        stock = yf.Ticker(ticker)
+        
+        # Method 1: Try from income statement
+        try:
+            income_stmt = stock.income_stmt
+            if 'Total Revenue' in income_stmt.index:
+                return income_stmt.loc['Total Revenue']
+        except Exception as e:
+            print(f"Method 1 failed to fetch revenue data: {e}")
+        
+        # Method 2: Try from quarterly data and annualize
+        try:
+            quarterly = stock.quarterly_financials
+            if 'Total Revenue' in quarterly.index:
+                quarterly_revenue = quarterly.loc['Total Revenue']
+                # If we have at least 4 quarters, create annual values
+                if len(quarterly_revenue) >= 4:
+                    # Create a rolling sum with window=4 to annualize quarterly data
+                    annual_revenue = quarterly_revenue.rolling(4).sum()
+                    return annual_revenue.dropna()
+                else:
+                    print("Not enough quarterly data points")
+        except Exception as e:
+            print(f"Method 2 failed to fetch revenue data: {e}")
+        
+        # Method 3: Try from financials
+        try:
+            financials = stock.financials
+            if 'Total Revenue' in financials.index:
+                return financials.loc['Total Revenue']
+        except Exception as e:
+            print(f"Method 3 failed to fetch revenue data: {e}")
+        
+        # If all methods fail, return None
+        print(f"Error fetching Revenues data for {ticker}")
+        return None    
+    # ########################################################################################################
+    # #-------------------------------------- Growth Rates Calculation --------------------------------------#
+    # ########################################################################################################
+
+    # def calculate_growth_rates(ticker, cik, financial_data=None, years_historical=5):
+    #     """
+    #     Calculate growth rates with improved data validation and regression analysis.
+        
+    #     Args:
+    #         ticker (str): Stock ticker symbol
+    #         cik (str): Company's CIK number
+    #         financial_data (dict): Financial data if already fetched
+    #         years_historical (int): Number of historical years to analyze
+        
+    #     Returns:
+    #         dict: Growth rates and components
+    #     """
+    #     print(f"Calculating growth rates for {ticker}...")
+        
+    #     try:
+    #         if financial_data and 'stock' in financial_data:
+    #             stock = financial_data['stock']
+    #         else:
+    #             stock = yf.Ticker(ticker)
+            
+    #         # Get cash flow statements
+    #         cash_flow_stmt = None
+    #         if financial_data and 'cash_flow' in financial_data:
+    #             cash_flow_stmt = financial_data['cash_flow']
+    #         else:
+    #             try:
+    #                 cash_flow_stmt = stock.cashflow
+    #                 if cash_flow_stmt.empty:
+    #                     print("Cash flow data empty, trying quarterly...")
+    #                     quarterly_cf = stock.quarterly_cashflow
+    #                     if not quarterly_cf.empty:
+    #                         # Aggregate quarterly data
+    #                         quarterly_years = {}
+    #                         for col in quarterly_cf.columns:
+    #                             year = col.year
+    #                             if year not in quarterly_years:
+    #                                 quarterly_years[year] = []
+    #                             quarterly_years[year].append(col)
+                            
+    #                         annual_cf = {}
+    #                         for year, cols in quarterly_years.items():
+    #                             if len(cols) == 4:  # Only use complete years
+    #                                 annual_cf[year] = quarterly_cf[cols].sum(axis=1)
+                            
+    #                         if annual_cf:
+    #                             cash_flow_stmt = pd.DataFrame(annual_cf)
+    #             except Exception as e:
+    #                 print(f"Error fetching cash flow: {e}")
+            
+    #         # Check if we have enough data
+    #         if cash_flow_stmt is None or cash_flow_stmt.empty or len(cash_flow_stmt.columns) < 2:
+    #             print("Insufficient cash flow data for growth calculation")
+    #             return default_growth_values(ticker, True)
+            
+    #         # Calculate historical Free Cash Flow (FCF)
+    #         historical_fcf = None
+    #         fcf_growth_rates = []
+            
+    #         if 'Free Cash Flow' in cash_flow_stmt.index:
+    #             historical_fcf = cash_flow_stmt.loc['Free Cash Flow']
+    #         elif all(item in cash_flow_stmt.index for item in ['Operating Cash Flow', 'Capital Expenditure']):
+    #             op_cash_flow = cash_flow_stmt.loc['Operating Cash Flow']
+    #             cap_ex = cash_flow_stmt.loc['Capital Expenditure']
+    #             historical_fcf = op_cash_flow + cap_ex  # Cap Ex is negative
+            
+    #         # Handle FCF calculation and growth rates
+    #         if historical_fcf is not None and len(historical_fcf) >= 2:
+    #             # Sort by date (recent first)
+    #             historical_fcf = historical_fcf.sort_index(ascending=False)
+                
+    #             # Calculate CAGR instead of year-over-year to smooth volatility
+    #             positive_fcf_years = historical_fcf[historical_fcf > 0]
+                
+    #             if len(positive_fcf_years) >= 2:
+    #                 # Get oldest and newest positive FCF values
+    #                 oldest_fcf = positive_fcf_years.iloc[-1]
+    #                 newest_fcf = positive_fcf_years.iloc[0]
+    #                 years_diff = len(positive_fcf_years) - 1
+                    
+    #                 if years_diff > 0 and oldest_fcf > 0:
+    #                     fcf_cagr = (newest_fcf / oldest_fcf) ** (1 / years_diff) - 1
+                        
+    #                     # Also calculate year-over-year rates for information
+    #                     for i in range(1, len(positive_fcf_years)):
+    #                         if positive_fcf_years.iloc[i-1] > 0 and positive_fcf_years.iloc[i] > 0:
+    #                             growth_rate = (positive_fcf_years.iloc[i-1] / positive_fcf_years.iloc[i]) - 1
+    #                             fcf_growth_rates.append(growth_rate)
+                        
+    #                     avg_historical_growth = fcf_cagr
+    #                 else:
+    #                     print("Cannot calculate FCF CAGR with available data")
+    #                     avg_historical_growth = np.mean(fcf_growth_rates) if fcf_growth_rates else None
+    #             else:
+    #                 print("Not enough positive FCF years for CAGR calculation")
+    #                 avg_historical_growth = None
+    #         else:
+    #             print("FCF data unavailable")
+    #             avg_historical_growth = None
+            
+    #         # Get revenue growth rates
+    #         revenue_growth_rates = []
+    #         avg_revenue_growth = None
+            
+    #         try:
+    #             income_stmt = stock.income_stmt
+    #             if income_stmt is not None and not income_stmt.empty and 'Total Revenue' in income_stmt.index:
+    #                 revenues = income_stmt.loc['Total Revenue'].sort_index(ascending=False)
+                    
+    #                 if len(revenues) >= 2:
+    #                     # Calculate revenue CAGR
+    #                     oldest_rev = revenues.iloc[-1]
+    #                     newest_rev = revenues.iloc[0]
+    #                     years_diff = len(revenues) - 1
+                        
+    #                     if oldest_rev > 0:
+    #                         revenue_cagr = (newest_rev / oldest_rev) ** (1 / years_diff) - 1
+                            
+    #                         # Also calculate YoY rates
+    #                         for i in range(1, len(revenues)):
+    #                             if revenues.iloc[i-1] > 0 and revenues.iloc[i] > 0:
+    #                                 growth_rate = (revenues.iloc[i-1] / revenues.iloc[i]) - 1
+    #                                 revenue_growth_rates.append(growth_rate)
+                            
+    #                         avg_revenue_growth = revenue_cagr
+    #             else:
+    #                 print("Revenue data not available in primary source")
+    #                 # Try alternative methods
+    #                 try:
+    #                     # Get quarterly data and convert to annual
+    #                     quarterly = stock.quarterly_financials
+    #                     if 'Total Revenue' in quarterly.index:
+    #                         revenues = quarterly.loc['Total Revenue']
+    #                         # Group by year and sum
+    #                         annual_revenues = {}
+    #                         for col in revenues.index:
+    #                             year = col.year
+    #                             if year not in annual_revenues:
+    #                                 annual_revenues[year] = 0
+    #                             annual_revenues[year] += revenues[col]
+                            
+    #                         # Convert to series and calculate growth
+    #                         if len(annual_revenues) >= 2:
+    #                             sorted_years = sorted(annual_revenues.keys(), reverse=True)
+    #                             for i in range(1, len(sorted_years)):
+    #                                 current = annual_revenues[sorted_years[i-1]]
+    #                                 previous = annual_revenues[sorted_years[i]]
+    #                                 if current > 0 and previous > 0:
+    #                                     growth_rate = (current / previous) - 1
+    #                                     revenue_growth_rates.append(growth_rate)
+                                
+    #                             avg_revenue_growth = np.mean(revenue_growth_rates) if revenue_growth_rates else None
+    #                 except Exception as e:
+    #                     print(f"Error with revenue calculation: {e}")
+    #         except Exception as e:
+    #             print(f"Error calculating revenue growth: {e}")
+            
+    #         # Get analyst estimates from yfinance (multiple ways)
+    #         analyst_growth_estimate = None
+            
+    #         # Method 1: earningsGrowth
+    #         try:
+    #             analyst_growth_estimate = stock.info.get('earningsGrowth')
+    #         except:
+    #             pass
+            
+    #         # Method 2: longBusinessSummary text analysis
+    #         if analyst_growth_estimate is None or np.isnan(analyst_growth_estimate):
+    #             try:
+    #                 summary = stock.info.get('longBusinessSummary', '')
+    #                 # This is more complex in reality, would need NLP
+    #                 # Simple implementation just for demonstration
+    #                 growth_indicators = ['growth rate of', 'expected to grow', 'growth forecast']
+    #                 for indicator in growth_indicators:
+    #                     if indicator in summary.lower():
+    #                         # Find numbers near growth indicators
+    #                         # (This is a placeholder - would need proper NLP)
+    #                         pass
+    #             except:
+    #                 pass
+            
+    #         # Method 3: Forward P/E vs Current P/E
+    #         if analyst_growth_estimate is None or np.isnan(analyst_growth_estimate):
+    #             try:
+    #                 forward_pe = stock.info.get('forwardPE')
+    #                 trailing_pe = stock.info.get('trailingPE')
+                    
+    #                 if forward_pe and trailing_pe and trailing_pe > 0:
+    #                     # Rough approximation based on PE ratios
+    #                     implied_growth = (trailing_pe / forward_pe) - 1
+    #                     if 0 <= implied_growth <= 1:
+    #                         analyst_growth_estimate = implied_growth
+    #             except:
+    #                 pass
+            
+    #         # Improved regression analysis for growth projection
+    #         regression_growth_rate = None
+            
+    #         if historical_fcf is not None and len(historical_fcf) >= 3:
+    #             try:
+    #                 # Use only positive FCF values
+    #                 positive_fcf = historical_fcf[historical_fcf > 0]
+                    
+    #                 if len(positive_fcf) >= 3:
+    #                     # Create array of years (0 = oldest)
+    #                     years = np.arange(len(positive_fcf))
+                        
+    #                     # Log transform for exponential growth model
+    #                     log_fcf = np.log(positive_fcf.values)
+                        
+    #                     # Linear regression on log values
+    #                     slope, intercept, r_value, p_value, std_err = stats.linregress(years, log_fcf)
+                        
+    #                     # Convert slope to growth rate
+    #                     regression_growth_rate = np.exp(slope) - 1
+                        
+    #                     # Validate regression results
+    #                     if r_value**2 < 0.3:  # Poor fit
+    #                         print(f"Regression has poor fit (R²={r_value**2:.2f}), results may be unreliable")
+                        
+    #                     # Cap regression-based growth
+    #                     if not (-0.2 <= regression_growth_rate <= 0.3):
+    #                         print(f"Regression produced extreme growth rate: {regression_growth_rate:.2%}")
+    #                         regression_growth_rate = None
+    #             except Exception as e:
+    #                 print(f"Error in regression calculation: {e}")
+            
+    #         # Determine company size and maturity for growth caps
+    #         market_cap = stock.info.get('marketCap', 0)
+            
+    #         if market_cap > 1e12:  # Over $1 trillion
+    #             max_growth = 0.10  # Cap at 10%
+    #             company_size = "Large Cap"
+    #         elif market_cap > 1e11:  # Over $100 billion
+    #             max_growth = 0.15  # Cap at 15%
+    #             company_size = "Large Cap"
+    #         elif market_cap > 1e10:  # Over $10 billion
+    #             max_growth = 0.20  # Cap at 20%
+    #             company_size = "Mid Cap"
+    #         else:
+    #             max_growth = 0.25  # Cap at 25%
+    #             company_size = "Small Cap"
+            
+    #         # Combine different growth estimates with dynamic weights
+    #         valid_estimates = {}
+            
+    #         if avg_historical_growth is not None and -0.2 <= avg_historical_growth <= 0.5:
+    #             valid_estimates['historical_fcf'] = {
+    #                 'value': avg_historical_growth,
+    #                 'weight': 0.3,
+    #                 'reliability': 'Medium' if len(fcf_growth_rates) >= 3 else 'Low'
+    #             }
+            
+    #         if avg_revenue_growth is not None and -0.2 <= avg_revenue_growth <= 0.5:
+    #             valid_estimates['revenue_growth'] = {
+    #                 'value': avg_revenue_growth,
+    #                 'weight': 0.2,
+    #                 'reliability': 'Medium' if len(revenue_growth_rates) >= 3 else 'Low'
+    #             }
+            
+    #         if analyst_growth_estimate is not None and 0 <= analyst_growth_estimate <= 1:
+    #             valid_estimates['analyst_estimate'] = {
+    #                 'value': analyst_growth_estimate,
+    #                 'weight': 0.3,
+    #                 'reliability': 'Medium'
+    #             }
+            
+    #         if regression_growth_rate is not None:
+    #             valid_estimates['regression'] = {
+    #                 'value': regression_growth_rate,
+    #                 'weight': 0.2,
+    #                 'reliability': 'Medium' if len(historical_fcf) >= 4 else 'Low'
+    #             }
+            
+    #         # Calculate weighted growth rate
+    #         if valid_estimates:
+    #             # Normalize weights
+    #             total_weight = sum(item['weight'] for item in valid_estimates.values())
+    #             weighted_growth = sum(item['value'] * (item['weight'] / total_weight) 
+    #                                 for item in valid_estimates.values())
+    #         else:
+    #             print("No valid growth estimates available, using industry-based default")
+    #             return default_growth_values(ticker, True)
+            
+    #         # Sanity check on final growth rate
+    #         if weighted_growth < 0:
+    #             print(f"Warning: Negative growth rate calculated: {weighted_growth:.2%}")
+    #             # Use small positive growth instead of negative growth
+    #             weighted_growth = max(0.01, weighted_growth + 0.03)
+    #         elif weighted_growth > max_growth:
+    #             print(f"Growth rate {weighted_growth:.2%} exceeds cap for company size, using {max_growth:.2%}")
+    #             weighted_growth = max_growth
+            
+    #         # Return results
+    #         return {
+    #             'short_term_growth': weighted_growth,
+    #             'historical_fcf_growth': avg_historical_growth,
+    #             'revenue_growth': avg_revenue_growth,
+    #             'analyst_estimate': analyst_growth_estimate,
+    #             'regression_growth': regression_growth_rate,
+    #             'company_size': company_size,
+    #             'max_growth_cap': max_growth,
+    #             'growth_components': {
+    #                 'fcf_growth_rates': fcf_growth_rates,
+    #                 'revenue_growth_rates': revenue_growth_rates,
+    #                 'valid_estimates': valid_estimates
+    #             }
+    #         }
+    #     except Exception as e:
+    #         print(f"Error calculating growth rates: {e}")
+    #         return default_growth_values(ticker)
+
+    # def default_growth_values(ticker, get_industry_average=False):
+    #     """
+    #     Provide default growth values based on industry averages if possible.
+    #             Provides more nuanced default growth values based on company characteristics when available.
+
+    #     Args:
+    #         ticker (str): Stock ticker symbol
+    #         get_industry_average (bool): Whether to attempt to get industry averages
+        
+    #     Returns:
+    #         dict: Default growth values
+    #     """
+    #     print("Using default growth values")
+        
+    #     if get_industry_average:
+    #         try:
+    #             stock = yf.Ticker(ticker)
+    #             market_cap = stock.info.get('marketCap', 0)
+    #             sector = stock.info.get('sector', '')
+    #             pe_ratio = stock.info.get('trailingPE', None)
+                
+    #             # Adjust default growth based on company size
+    #             if market_cap > 1e12:  # Over $1 trillion
+    #                 default_growth = 0.04  # 4% for mega caps
+    #             elif market_cap > 1e11:  # Over $100 billion
+    #                 default_growth = 0.05  # 5% for large caps
+    #             elif market_cap > 1e10:  # Over $10 billion
+    #                 default_growth = 0.06  # 6% for mid caps
+    #             else:
+    #                 default_growth = 0.08  # 8% for small caps
+                
+    #             # Adjust based on sector
+    #             if sector.lower() in ['technology', 'information technology', 'communication services']:
+    #                 default_growth += 0.02  # Add 2% for tech/growth sectors
+    #             elif sector.lower() in ['healthcare', 'consumer discretionary']:
+    #                 default_growth += 0.01  # Add 1% for growth-oriented sectors
+    #             elif sector.lower() in ['utilities', 'consumer staples', 'energy']:
+    #                 default_growth -= 0.01  # Subtract 1% for stable/slow-growth sectors
+                
+    #             # Further adjust if PE ratio is available (high PE often implies higher growth expectations)
+    #             if pe_ratio and not np.isnan(pe_ratio) and pe_ratio > 0:
+    #                 if pe_ratio > 30:
+    #                     default_growth += 0.01  # Add 1% for high P/E stocks
+    #                 elif pe_ratio < 15:
+    #                     default_growth -= 0.01  # Subtract 1% for low P/E stocks
+                
+    #             print(f"Adjusted default growth for {ticker} based on company characteristics: {default_growth:.2%}")
+                
+    #         except Exception as e:
+    #             print(f"Error getting company info for default growth: {e}")
+        
+    #     return {
+    #         'short_term_growth': default_growth,
+    #         'historical_fcf_growth': default_growth,
+    #         'revenue_growth': default_growth * 1.1,  # Revenue often grows slightly faster than FCF
+    #         'analyst_estimate': default_growth * 1.2,  # Analysts tend to be optimistic
+    #         'regression_growth': default_growth * 0.9,  # Regression often more conservative
+    #         'growth_components': {
+    #             'fcf_growth_rates': [],
+    #             'revenue_growth_rates': []
+    #         }
+    #     }
+
+
+    # ---  Code I'm working on ----#
+    def calculate_growth_rates(ticker, cik, financial_data=None, years_historical=5):
+        """
+        Calculate growth rates with improved data validation and regression analysis.
+        
+        Args:
+            ticker (str): Stock ticker symbol
+            cik (str): Company's CIK number
+            financial_data (dict): Financial data if already fetched
+            years_historical (int): Number of historical years to analyze
+        
+        Returns:
+            dict: Growth rates and components
+        """
+        print(f"Calculating growth rates for {ticker}...")
+        
+        try:
+            # Initialize with default values in case of failure
+            default_values = default_growth_values(ticker, True)
+            
+            # Try to get stock data from yfinance or financial_data
+            if financial_data and 'stock' in financial_data:
+                stock = financial_data['stock']
+            else:
+                try:
+                    stock = yf.Ticker(ticker)
+                except Exception as e:
+                    print(f"Error fetching stock data: {e}")
+                    return default_values
+            
+            # Get cash flow data with multiple fallback methods
+            cash_flow_stmt = get_cash_flow_data(stock, financial_data)
+            
+            # Get revenue data with multiple fallback methods
+            revenues = get_revenue_data(stock)
+            
+            # If we still don't have enough data, use defaults
+            if (cash_flow_stmt is None or cash_flow_stmt.empty or len(cash_flow_stmt.columns) < 2 or
+                revenues is None or len(revenues) < 2):
+                print("Insufficient financial data for growth calculation")
+                return default_values
+            
+            # Calculate FCF and growth rates with robust error handling
+            historical_fcf, fcf_growth_rates, avg_historical_growth = calculate_fcf_growth(cash_flow_stmt)
+            
+            # Calculate revenue growth rates with robust error handling
+            revenue_growth_rates, avg_revenue_growth = calculate_revenue_growth(revenues)
+            
+            # Get analyst estimates from multiple sources
+            analyst_growth_estimate = get_analyst_estimates(stock)
+            
+            # Perform regression analysis for growth projection
+            regression_growth_rate = calculate_regression_growth(historical_fcf)
+            
+            # Determine company size and apply appropriate growth caps
+            market_cap, company_size, max_growth = determine_company_size(stock)
+            
+            # Combine different growth estimates with weighted approach
+            valid_estimates = combine_growth_estimates(
+                avg_historical_growth, fcf_growth_rates,
+                avg_revenue_growth, revenue_growth_rates,
+                analyst_growth_estimate, regression_growth_rate
+            )
+            
+            # Calculate final weighted growth rate
+            weighted_growth = calculate_weighted_growth(valid_estimates, max_growth)
+            
+            # Return results in the expected format
+            return {
+                'short_term_growth': weighted_growth,
+                'historical_fcf_growth': avg_historical_growth,
+                'revenue_growth': avg_revenue_growth,
+                'analyst_estimate': analyst_growth_estimate,
+                'regression_growth': regression_growth_rate,
+                'company_size': company_size,
+                'max_growth_cap': max_growth,
+                'growth_components': {
+                    'fcf_growth_rates': fcf_growth_rates,
+                    'revenue_growth_rates': revenue_growth_rates,
+                    'valid_estimates': valid_estimates
+                }
+            }
+        except Exception as e:
+            print(f"Error calculating growth rates: {e}")
+            traceback.print_exc()  # Show detailed error information
+            return default_growth_values(ticker)
+
+    def get_cash_flow_data(stock, financial_data=None):
+        """
+        Get cash flow data with multiple fallback methods.
+        
+        Args:
+            stock: yfinance Ticker object
+            financial_data: Pre-fetched financial data if available
+        
+        Returns:
+            DataFrame: Cash flow statement data
+        """
+        cash_flow_stmt = None
+        
+        # Try method 1: Use pre-fetched data if available
+        if financial_data and 'cash_flow' in financial_data:
+            cash_flow_stmt = financial_data['cash_flow']
+            if cash_flow_stmt is not None and not cash_flow_stmt.empty:
+                return cash_flow_stmt
+        
+        # Try method 2: Get annual data from yfinance
+        try:
+            cash_flow_stmt = stock.cashflow
+            if cash_flow_stmt is not None and not cash_flow_stmt.empty:
+                return cash_flow_stmt
+        except Exception as e:
+            print(f"Error fetching annual cash flow: {e}")
+        
+        # Try method 3: Get quarterly data and aggregate to annual
+        try:
+            quarterly_cf = stock.quarterly_cashflow
+            if quarterly_cf is not None and not quarterly_cf.empty:
+                print("Using quarterly cash flow data aggregated to annual...")
+                # Aggregate quarterly data to annual
+                quarterly_years = {}
+                for col in quarterly_cf.columns:
+                    year = col.year
+                    if year not in quarterly_years:
+                        quarterly_years[year] = []
+                    quarterly_years[year].append(col)
+                
+                # Create a new DataFrame for annual data
+                annual_data = {}
+                for year, cols in quarterly_years.items():
+                    # Only use years with complete data (4 quarters)
+                    if len(cols) == 4:
+                        annual_data[datetime(year, 12, 31)] = quarterly_cf[cols].sum(axis=1)
+                    # Also accept years with at least 3 quarters and annualize
+                    elif len(cols) >= 3:
+                        # Annualize based on available quarters
+                        annualization_factor = 4 / len(cols)
+                        annual_data[datetime(year, 12, 31)] = quarterly_cf[cols].sum(axis=1) * annualization_factor
+                
+                if annual_data:
+                    return pd.DataFrame(annual_data)
+        except Exception as e:
+            print(f"Error processing quarterly cash flow: {e}")
+        
+        # Try method 4: Fetch data using SEC API
+        try:
+            # This is a placeholder for using Edgar API to get cash flow
+            # In a real implementation, you would use the SEC's EDGAR API
+            # to fetch the cash flow statement data
+            pass
+        except Exception as e:
+            print(f"Error fetching SEC data: {e}")
+        
+        return None
+
+    def get_revenue_data(stock):
+        """
+        Get revenue data with multiple fallback methods.
+        
+        Args:
+            stock: yfinance Ticker object
+        
+        Returns:
+            pandas.Series: Revenue data by date
+        """
+        revenues = None
+        
+        # Try method 1: Get from income statement
+        try:
+            income_stmt = stock.income_stmt
+            if income_stmt is not None and not income_stmt.empty and 'Total Revenue' in income_stmt.index:
+                revenues = income_stmt.loc['Total Revenue'].sort_index(ascending=False)
+                if len(revenues) >= 2:
+                    return revenues
+        except Exception as e:
+            print(f"Error fetching income statement: {e}")
+        
+        # Try method 2: Get from quarterly income statement and aggregate
+        try:
+            quarterly = stock.quarterly_financials
+            if quarterly is not None and not quarterly.empty and 'Total Revenue' in quarterly.index:
+                q_revenues = quarterly.loc['Total Revenue']
+                
+                # Group by year and sum to create annual data
+                annual_revenues = {}
+                for date in q_revenues.index:
+                    year = date.year
+                    if year not in annual_revenues:
+                        annual_revenues[year] = 0
+                    annual_revenues[year] += q_revenues[date]
+                
+                # Convert to Series
+                if len(annual_revenues) >= 2:
+                    years_sorted = sorted(annual_revenues.keys(), reverse=True)
+                    annual_series = pd.Series(
+                        [annual_revenues[year] for year in years_sorted],
+                        index=[datetime(year, 12, 31) for year in years_sorted]
+                    )
+                    return annual_series
+        except Exception as e:
+            print(f"Error processing quarterly revenue: {e}")
+        
+        # Try method 3: Get from annual financials directly
+        try:
+            financials = stock.financials
+            if financials is not None and not financials.empty and 'Total Revenue' in financials.index:
+                revenues = financials.loc['Total Revenue'].sort_index(ascending=False)
+                if len(revenues) >= 2:
+                    return revenues
+        except Exception as e:
+            print(f"Error fetching financials: {e}")
+        
+        # Try method 4: Use historical income statement from info
+        try:
+            if 'incomeStatementHistory' in stock.info:
+                hist = stock.info['incomeStatementHistory']['incomeStatementHistory']
+                annual_revenues = {}
+                for period in hist:
+                    if 'totalRevenue' in period:
+                        date = datetime.fromtimestamp(period.get('endDate', {}).get('timestamp', 0))
+                        annual_revenues[date] = period['totalRevenue']
+                
+                if len(annual_revenues) >= 2:
+                    return pd.Series(annual_revenues)
+        except Exception as e:
+            print(f"Error processing income statement history: {e}")
+        
+        return None
+
+    def calculate_fcf_growth(cash_flow_stmt):
+        """
+        Calculate FCF and growth rates with robust error handling.
+        
+        Args:
+            cash_flow_stmt: Cash flow statement DataFrame
+        
+        Returns:
+            tuple: (historical_fcf, fcf_growth_rates, avg_historical_growth)
+        """
+        historical_fcf = None
+        fcf_growth_rates = []
+        avg_historical_growth = None
+        
+        # Try to get FCF directly
+        if 'Free Cash Flow' in cash_flow_stmt.index:
+            historical_fcf = cash_flow_stmt.loc['Free Cash Flow']
+        # Calculate FCF from components
+        elif all(item in cash_flow_stmt.index for item in ['Operating Cash Flow', 'Capital Expenditure']):
+            op_cash_flow = cash_flow_stmt.loc['Operating Cash Flow']
+            cap_ex = cash_flow_stmt.loc['Capital Expenditure']
+            historical_fcf = op_cash_flow + cap_ex  # Cap Ex is typically negative
+        # Try alternative row names
+        elif all(item in cash_flow_stmt.index for item in ['Cash Flow from Operations', 'Capital Expenditures']):
+            op_cash_flow = cash_flow_stmt.loc['Cash Flow from Operations']
+            cap_ex = cash_flow_stmt.loc['Capital Expenditures']
+            historical_fcf = op_cash_flow + cap_ex
+        
+        # If we have FCF data, calculate growth rates
+        if historical_fcf is not None and len(historical_fcf) >= 2:
+            # Sort by date (recent first)
+            historical_fcf = historical_fcf.sort_index(ascending=False)
+            
+            # Handle negative FCF values - replace with small positive values
+            # to allow growth calculations but flag this as lower quality data
+            modified_fcf = historical_fcf.copy()
+            neg_values_replaced = False
+            
+            if (modified_fcf <= 0).any():
+                min_positive = modified_fcf[modified_fcf > 0].min() if (modified_fcf > 0).any() else 1e6
+                small_value = min_positive * 0.1  # Use 10% of smallest positive value
+                
+                # Replace negatives with small positive values
+                neg_mask = modified_fcf <= 0
+                if neg_mask.any():
+                    modified_fcf[neg_mask] = small_value
+                    neg_values_replaced = True
+                    print(f"Warning: Negative FCF values replaced for growth calculation")
+            
+            # Calculate year-over-year growth rates
+            for i in range(1, len(modified_fcf)):
+                current = modified_fcf.iloc[i-1]
+                previous = modified_fcf.iloc[i]
+                
+                if current > 0 and previous > 0:
+                    growth_rate = (current / previous) - 1
+                    # Cap extreme growth rates
+                    growth_rate = max(min(growth_rate, 1.0), -0.5)
+                    fcf_growth_rates.append(growth_rate)
+            
+            # Calculate CAGR for smoother growth estimate
+            if len(modified_fcf) >= 3:
+                oldest_fcf = modified_fcf.iloc[-1]
+                newest_fcf = modified_fcf.iloc[0]
+                years_diff = len(modified_fcf) - 1
+                
+                if oldest_fcf > 0 and newest_fcf > 0:
+                    fcf_cagr = (newest_fcf / oldest_fcf) ** (1 / years_diff) - 1
+                    
+                    # Use CAGR if reasonable, otherwise use average of YoY rates
+                    if -0.2 <= fcf_cagr <= 0.5:
+                        avg_historical_growth = fcf_cagr
+                    else:
+                        # If CAGR is extreme, use trimmed mean of YoY rates
+                        sorted_rates = sorted(fcf_growth_rates)
+                        trimmed_rates = sorted_rates[1:-1] if len(sorted_rates) > 4 else sorted_rates
+                        avg_historical_growth = np.mean(trimmed_rates) if trimmed_rates else None
+                else:
+                    avg_historical_growth = np.mean(fcf_growth_rates) if fcf_growth_rates else None
+            else:
+                avg_historical_growth = np.mean(fcf_growth_rates) if fcf_growth_rates else None
+                
+            # Apply quality discount if we had to replace negative values
+            if neg_values_replaced and avg_historical_growth is not None:
+                avg_historical_growth *= 0.7  # 30% discount for data quality issues
+        
+        return historical_fcf, fcf_growth_rates, avg_historical_growth
+
+    def calculate_revenue_growth(revenues):
+        """
+        Calculate revenue growth rates with robust error handling.
+        
+        Args:
+            revenues: Revenue data Series
+        
+        Returns:
+            tuple: (revenue_growth_rates, avg_revenue_growth)
+        """
+        revenue_growth_rates = []
+        avg_revenue_growth = None
+        
+        if revenues is not None and len(revenues) >= 2:
+            # Calculate year-over-year growth rates
+            for i in range(1, len(revenues)):
+                current = revenues.iloc[i-1]
+                previous = revenues.iloc[i]
+                
+                if current > 0 and previous > 0:
+                    growth_rate = (current / previous) - 1
+                    # Cap extreme growth rates
+                    growth_rate = max(min(growth_rate, 1.0), -0.5)
+                    revenue_growth_rates.append(growth_rate)
+            
+            # Calculate CAGR for smoother growth estimate
+            if len(revenues) >= 3:
+                oldest_rev = revenues.iloc[-1]
+                newest_rev = revenues.iloc[0]
+                years_diff = len(revenues) - 1
+                
+                if oldest_rev > 0 and newest_rev > 0:
+                    rev_cagr = (newest_rev / oldest_rev) ** (1 / years_diff) - 1
+                    
+                    # Use CAGR if reasonable, otherwise use average of YoY rates
+                    if -0.2 <= rev_cagr <= 0.5:
+                        avg_revenue_growth = rev_cagr
+                    else:
+                        # If CAGR is extreme, use trimmed mean of YoY rates
+                        sorted_rates = sorted(revenue_growth_rates)
+                        trimmed_rates = sorted_rates[1:-1] if len(sorted_rates) > 4 else sorted_rates
+                        avg_revenue_growth = np.mean(trimmed_rates) if trimmed_rates else None
+                else:
+                    avg_revenue_growth = np.mean(revenue_growth_rates) if revenue_growth_rates else None
+            else:
+                avg_revenue_growth = np.mean(revenue_growth_rates) if revenue_growth_rates else None
+        
+        return revenue_growth_rates, avg_revenue_growth
+
+    def get_analyst_estimates(stock):
+        """
+        Get analyst growth estimates from multiple sources.
+        
+        Args:
+            stock: yfinance Ticker object
+        
+        Returns:
+            float: Analyst growth estimate
+        """
+        analyst_growth_estimate = None
+        
+        # Method 1: earningsGrowth from info
+        try:
+            growth = stock.info.get('earningsGrowth')
+            if growth is not None and not np.isnan(growth):
+                analyst_growth_estimate = growth
+                return analyst_growth_estimate
+        except:
+            pass
+        
+        # Method 2: Use analyst target price vs current price
+        try:
+            target_price = stock.info.get('targetMeanPrice')
+            current_price = stock.info.get('currentPrice', stock.info.get('regularMarketPrice'))
+            
+            if target_price and current_price and current_price > 0:
+                # Calculate implied annual growth rate (assuming 1-year target)
+                implied_growth = (target_price / current_price) - 1
+                
+                # Only use if reasonable
+                if 0 <= implied_growth <= 0.5:
+                    if analyst_growth_estimate is None:
+                        analyst_growth_estimate = implied_growth
+                    else:
+                        # Average with previous estimate
+                        analyst_growth_estimate = (analyst_growth_estimate + implied_growth) / 2
+        except:
+            pass
+        
+        # Method 3: Use forward P/E vs. trailing P/E ratio
+        try:
+            forward_pe = stock.info.get('forwardPE')
+            trailing_pe = stock.info.get('trailingPE')
+            
+            if forward_pe and trailing_pe and trailing_pe > 0 and forward_pe > 0:
+                # Rough approximation based on PE ratios (assumes PE expansion/contraction related to growth)
+                implied_growth = (trailing_pe / forward_pe) - 1
+                
+                # Only use if reasonable
+                if 0 <= implied_growth <= 0.5:
+                    if analyst_growth_estimate is None:
+                        analyst_growth_estimate = implied_growth
+                    else:
+                        # Use weighted average (more weight to earningsGrowth if available)
+                        analyst_growth_estimate = 0.7 * analyst_growth_estimate + 0.3 * implied_growth
+        except:
+            pass
+        
+        # Method 4: Use long-term EPS growth estimate
+        try:
+            lt_growth = stock.info.get('earningsQuarterlyGrowth')
+            if lt_growth is not None and not np.isnan(lt_growth) and -0.5 <= lt_growth <= 1.0:
+                if analyst_growth_estimate is None:
+                    analyst_growth_estimate = lt_growth
+                else:
+                    # Weight with previous estimates
+                    analyst_growth_estimate = 0.6 * analyst_growth_estimate + 0.4 * lt_growth
+        except:
+            pass
+        
+        # Method 5: Extract from business summary using regex (simplified NLP)
+        try:
+            summary = stock.info.get('longBusinessSummary', '')
+            growth_patterns = [
+                r'growth\s+of\s+(\d+(?:\.\d+)?)\s*%',
+                r'expected\s+to\s+grow\s+(?:by\s+)?(\d+(?:\.\d+)?)\s*%',
+                r'growth\s+rate\s+of\s+(\d+(?:\.\d+)?)\s*%'
+            ]
+            
+            for pattern in growth_patterns:
+                matches = re.findall(pattern, summary.lower())
+                if matches:
+                    # Use the first match
+                    extracted_growth = float(matches[0]) / 100.0
+                    
+                    # Only use if reasonable
+                    if 0 <= extracted_growth <= 0.5:
+                        if analyst_growth_estimate is None:
+                            analyst_growth_estimate = extracted_growth
+                        else:
+                            # Use with low weight since this is less reliable
+                            analyst_growth_estimate = 0.8 * analyst_growth_estimate + 0.2 * extracted_growth
+                        break
+        except:
+            pass
+        
+        return analyst_growth_estimate
+
+    def calculate_regression_growth(historical_fcf):
+        """
+        Perform regression analysis for growth projection.
+        
+        Args:
+            historical_fcf: Historical FCF Series
+        
+        Returns:
+            float: Regression-based growth rate
+        """
+        regression_growth_rate = None
+        
+        if historical_fcf is not None and len(historical_fcf) >= 3:
+            try:
+                # Use only positive FCF values for log transformation
+                positive_fcf = historical_fcf[historical_fcf > 0]
+                
+                if len(positive_fcf) >= 3:
+                    # Create array of years (0 = oldest)
+                    years = np.arange(len(positive_fcf))
+                    
+                    # Log transform for exponential growth model
+                    log_fcf = np.log(positive_fcf.values)
+                    
+                    # Linear regression on log values
+                    slope, intercept, r_value, p_value, std_err = stats.linregress(years, log_fcf)
+                    
+                    # Convert slope to growth rate
+                    regression_growth_rate = np.exp(slope) - 1
+                    
+                    # Validate regression results
+                    if r_value**2 < 0.3:  # Poor fit
+                        print(f"Regression has poor fit (R²={r_value**2:.2f}), results may be unreliable")
+                        # Downweight the regression result due to poor fit
+                        regression_growth_rate *= 0.7
+                    
+                    # Cap extreme growth rates
+                    regression_growth_rate = max(min(regression_growth_rate, 0.3), -0.2)
+            except Exception as e:
+                print(f"Error in regression calculation: {e}")
+        
+        return regression_growth_rate
+
+    def determine_company_size(stock):
+        """
+        Determine company size and apply appropriate growth caps.
+        
+        Args:
+            stock: yfinance Ticker object
+        
+        Returns:
+            tuple: (market_cap, company_size, max_growth)
+        """
+        try:
+            market_cap = stock.info.get('marketCap', 0)
+            
+            if market_cap > 1e12:  # Over $1 trillion
+                max_growth = 0.10  # Cap at 10%
+                company_size = "Large Cap"
+            elif market_cap > 1e11:  # Over $100 billion
+                max_growth = 0.15  # Cap at 15%
+                company_size = "Large Cap"
+            elif market_cap > 1e10:  # Over $10 billion
+                max_growth = 0.20  # Cap at 20%
+                company_size = "Mid Cap"
+            else:
+                max_growth = 0.25  # Cap at 25%
+                company_size = "Small Cap"
+        except:
+            # Default values if we can't determine market cap
+            market_cap = 0
+            max_growth = 0.15
+            company_size = "Unknown"
+        
+        return market_cap, company_size, max_growth
+
+    def combine_growth_estimates(avg_historical_growth, fcf_growth_rates, 
+                                avg_revenue_growth, revenue_growth_rates,
+                                analyst_growth_estimate, regression_growth_rate):
+        """
+        Combine different growth estimates with weighted approach.
+        
+        Args:
+            Various growth metrics
+        
+        Returns:
+            dict: Valid growth estimates with weights
+        """
+        valid_estimates = {}
+        
+        # Add historical FCF growth if valid
+        if avg_historical_growth is not None and -0.2 <= avg_historical_growth <= 0.5:
+            reliability = 'High' if len(fcf_growth_rates) >= 4 else 'Medium' if len(fcf_growth_rates) >= 2 else 'Low'
+            weight = 0.4 if reliability == 'High' else 0.3 if reliability == 'Medium' else 0.2
+            
+            valid_estimates['historical_fcf'] = {
+                'value': avg_historical_growth,
+                'weight': weight,
+                'reliability': reliability
+            }
+        
+        # Add revenue growth if valid
+        if avg_revenue_growth is not None and -0.2 <= avg_revenue_growth <= 0.5:
+            reliability = 'High' if len(revenue_growth_rates) >= 4 else 'Medium' if len(revenue_growth_rates) >= 2 else 'Low'
+            weight = 0.3 if reliability == 'High' else 0.25 if reliability == 'Medium' else 0.15
+            
+            valid_estimates['revenue_growth'] = {
+                'value': avg_revenue_growth,
+                'weight': weight,
+                'reliability': reliability
+            }
+        
+        # Add analyst estimate if valid
+        if analyst_growth_estimate is not None and 0 <= analyst_growth_estimate <= 0.5:
+            valid_estimates['analyst_estimate'] = {
+                'value': analyst_growth_estimate,
+                'weight': 0.3,
+                'reliability': 'Medium'
+            }
+        
+        # Add regression growth if valid
+        if regression_growth_rate is not None and -0.2 <= regression_growth_rate <= 0.3:
+            valid_estimates['regression'] = {
+                'value': regression_growth_rate,
+                'weight': 0.2,
+                'reliability': 'Medium'
+            }
+        
+        return valid_estimates
+
+    def calculate_weighted_growth(valid_estimates, max_growth):
+        """
+        Calculate final weighted growth rate.
+        
+        Args:
+            valid_estimates: Dict of valid growth estimates
+            max_growth: Maximum allowed growth rate
+        
+        Returns:
+            float: Weighted growth rate
+        """
+        # Default to a conservative growth rate if no valid estimates
+        default_growth = 0.03
+        
+        if not valid_estimates:
+            print("No valid growth estimates available, using default growth")
+            return default_growth
+        
+        # Normalize weights
+        total_weight = sum(item['weight'] for item in valid_estimates.values())
+        weighted_growth = sum(item['value'] * (item['weight'] / total_weight) 
+                        for item in valid_estimates.values())
+        
+        # Sanity check on final growth rate
+        if weighted_growth < 0:
+            print(f"Warning: Negative growth rate calculated: {weighted_growth:.2%}")
+            # Use small positive growth instead of negative growth
+            weighted_growth = max(0.01, weighted_growth + 0.03)
+        elif weighted_growth > max_growth:
+            print(f"Growth rate {weighted_growth:.2%} exceeds cap for company size, using {max_growth:.2%}")
+            weighted_growth = max_growth
+        
+        return weighted_growth
+
+    #---------------------------------------- Didn't finish script ----------------------------------------------#
+
+    # def default_growth_values(ticker, get_industry_average=False):
+    #     """
+    #     Provide default growth values based on industry averages if possible.
+    #     Provides more nuanced default growth values based on company characteristics when available.
+
+    #     Args:
+    #         ticker (str): Stock ticker symbol
+    #         get_industry_average (bool): Whether to attempt to get industry averages
+        
+    #     Returns:
+    #         dict: Default growth values
+    #     """
+    #     print("Using default growth values")
+        
+    #     # Start with a conservative default
+    #     default_growth = 0.03
+        
+    #     if get_industry_average:
+    #         try:
+    #             stock = yf.Ticker(ticker)
+    #             market_cap = stock.info.get('marketCap', 0)
+    #             sector = stock.info.get('sector', '')
+    #             industry = stock.info.get('industry', '')
+    #             pe_ratio = stock.info.get('trailingPE', None)
+                
+    #             # Try to get industry average growth
+    #             industry_growth = get_industry_growth_rate(industry, sector)
+    #             if industry_growth is not None:
+    #                 default_growth = industry_growth
+    #             else:
+    #                 # Adjust default growth based on
+
+    #---------------------------------------- End didn't finish script ----------------------------------------------#
+
+
+    def default_growth_values(ticker, get_industry_average=False):
+        """
+        Provide default growth values based on industry averages if possible.
+        Provides more nuanced default growth values based on company characteristics when available.
+
+        Args:
+            ticker (str): Stock ticker symbol
+            get_industry_average (bool): Whether to attempt to get industry averages
+        
+        Returns:
+            dict: Default growth values
+        """
+        print(f"Calculating default growth values for {ticker}...")
+        
+        # Start with a conservative default
+        default_growth = 0.03
+        
+        if get_industry_average:
+            try:
+                stock = yf.Ticker(ticker)
+                
+                # Get company characteristics
+                market_cap = stock.info.get('marketCap', 0)
+                sector = stock.info.get('sector', '')
+                industry = stock.info.get('industry', '')
+                pe_ratio = stock.info.get('trailingPE', None)
+                dividend_yield = stock.info.get('dividendYield', None)
+                profit_margins = stock.info.get('profitMargins', None)
+                
+                # Try to get industry average growth from external function
+                industry_growth = get_industry_growth_rate(industry, sector)
+                if industry_growth is not None:
+                    default_growth = industry_growth
+                else:
+                    # Adjust default growth based on company size
+                    if market_cap > 1e12:  # Over $1 trillion
+                        default_growth = 0.04  # 4% for mega caps
+                    elif market_cap > 1e11:  # Over $100 billion
+                        default_growth = 0.05  # 5% for large caps
+                    elif market_cap > 1e10:  # Over $10 billion
+                        default_growth = 0.06  # 6% for mid caps
+                    elif market_cap > 1e9:   # Over $1 billion
+                        default_growth = 0.08  # 8% for small caps
+                    else:
+                        default_growth = 0.1  # 10% for micro caps
+                    
+                    # Adjust based on sector growth characteristics
+                    growth_sectors = ['technology', 'information technology', 'communication services', 
+                                    'healthcare', 'consumer discretionary']
+                    stable_sectors = ['utilities', 'consumer staples', 'energy', 'real estate']
+                    cyclical_sectors = ['industrials', 'materials', 'financials']
+                    
+                    sector_lower = sector.lower()
+                    
+                    if any(s in sector_lower for s in growth_sectors):
+                        default_growth += 0.02  # Add 2% for growth sectors
+                    elif any(s in sector_lower for s in stable_sectors):
+                        default_growth -= 0.01  # Subtract 1% for stable sectors
+                    elif any(s in sector_lower for s in cyclical_sectors):
+                        default_growth += 0.01  # Add 1% for cyclical sectors with some growth
+                
+                # Further adjustments based on company-specific metrics
+                
+                # PE ratio adjustment (high PE often implies higher growth expectations)
+                if pe_ratio and not np.isnan(pe_ratio) and pe_ratio > 0:
+                    if pe_ratio > 30:
+                        default_growth += 0.01  # Add 1% for high P/E stocks
+                    elif pe_ratio < 15:
+                        default_growth -= 0.01  # Subtract 1% for low P/E stocks
+                
+                # Dividend yield adjustment (high dividend often means lower growth)
+                if dividend_yield and not np.isnan(dividend_yield) and dividend_yield > 0:
+                    if dividend_yield > 0.04:  # 4%+
+                        default_growth -= 0.02  # Higher yield often means lower growth
+                    elif dividend_yield > 0.02:  # 2-4%
+                        default_growth -= 0.01  # Moderate dividend payer
+                
+                # Profit margin adjustment (higher margins can sustain higher growth)
+                if profit_margins and not np.isnan(profit_margins) and profit_margins > 0:
+                    if profit_margins > 0.2:  # 20%+ margins
+                        default_growth += 0.01  # High margin business can invest more in growth
+                    elif profit_margins < 0.05:  # <5% margins
+                        default_growth -= 0.01  # Low margin may constrain growth
+                
+                # Beta adjustment (if available) - higher beta often associated with higher growth
+                beta = stock.info.get('beta', None)
+                if beta and not np.isnan(beta):
+                    if beta > 1.5:
+                        default_growth += 0.01  # Higher volatility stocks often have higher growth
+                    elif beta < 0.8:
+                        default_growth -= 0.01  # Lower volatility often means stabler, slower growth
+                
+                # Check recent performance as indicator of momentum
+                try:
+                    # Get 1-year price change
+                    hist = stock.history(period="1y")
+                    if not hist.empty:
+                        start_price = hist['Close'].iloc[0]
+                        end_price = hist['Close'].iloc[-1]
+                        yearly_return = (end_price / start_price) - 1
+                        
+                        if yearly_return > 0.3:  # 30%+ return
+                            default_growth += 0.01  # Strong momentum may indicate continued growth
+                        elif yearly_return < -0.2:  # 20%+ decline
+                            default_growth -= 0.01  # Struggling companies may face headwinds
+                except Exception as e:
+                    print(f"Error calculating price momentum: {e}")
+                
+                # Apply sanity checks on final default growth rate
+                default_growth = max(min(default_growth, 0.25), 0.01)  # Cap between 1% and 25%
+                
+                print(f"Adjusted default growth for {ticker} based on company characteristics: {default_growth:.2%}")
+                
+            except Exception as e:
+                print(f"Error getting company info for default growth: {e}")
+                traceback.print_exc()
+        
+        # Create a complete result dict matching the structure expected by the main function
+        return {
+            'short_term_growth': default_growth,
+            'historical_fcf_growth': default_growth * 0.9,  # Slightly more conservative
+            'revenue_growth': default_growth * 1.1,  # Revenue often grows slightly faster than FCF
+            'analyst_estimate': default_growth * 1.2,  # Analysts tend to be optimistic
+            'regression_growth': default_growth * 0.9,  # Regression often more conservative
+            'company_size': get_company_size_category(market_cap) if get_industry_average else "Unknown",
+            'max_growth_cap': get_max_growth_cap(market_cap) if get_industry_average else 0.15,
+            'growth_components': {
+                'fcf_growth_rates': [],
+                'revenue_growth_rates': [],
+                'valid_estimates': {}
+            }
+        }
+
+
+    def get_industry_growth_rate(industry, sector):
+        """
+        Get average growth rate for specific industry.
+        This is a simplified implementation - in a production environment,
+        you might fetch this data from an external API or database.
+        
+        Args:
+            industry (str): Company's industry
+            sector (str): Company's sector
+        
+        Returns:
+            float: Industry average growth rate or None if not found
+        """
+        # You could replace this with actual industry data from a dataset
+        # This is a simplified example with some common industries
+        industry_growth_rates = {
+            # Technology
+            'software': 0.12,
+            'semiconductors': 0.10,
+            'hardware': 0.07,
+            'internet content & information': 0.15,
+            
+            # Healthcare
+            'biotechnology': 0.14,
+            'medical devices': 0.08,
+            'pharmaceuticals': 0.06,
+            'healthcare plans': 0.05,
+            
+            # Consumer
+            'retail': 0.04,
+            'restaurants': 0.05,
+            'beverages': 0.03,
+            'luxury goods': 0.06,
+            
+            # Finance
+            'banks': 0.04,
+            'insurance': 0.05,
+            'asset management': 0.06,
+            'fintech': 0.15,
+            
+            # Energy & Utilities
+            'oil & gas': 0.02,
+            'utilities': 0.03,
+            'renewable energy': 0.15,
+            
+            # Other
+            'telecom': 0.04,
+            'media': 0.06,
+            'real estate': 0.04,
+            'aerospace & defense': 0.05
+        }
+        
+        # Check if we have a direct match
+        industry_lower = industry.lower()
+        for key, growth_rate in industry_growth_rates.items():
+            if key in industry_lower:
+                return growth_rate
+        
+        # Fallback to sector-based averages if industry not found
+        sector_growth_rates = {
+            'technology': 0.10,
+            'information technology': 0.10,
+            'healthcare': 0.08,
+            'consumer discretionary': 0.06,
+            'consumer staples': 0.04,
+            'financials': 0.05,
+            'energy': 0.03,
+            'utilities': 0.03,
+            'real estate': 0.04,
+            'communication services': 0.06,
+            'industrials': 0.05,
+            'materials': 0.04
+        }
+        
+        sector_lower = sector.lower()
+        for key, growth_rate in sector_growth_rates.items():
+            if key in sector_lower:
+                return growth_rate
+        
+        # Return None if no match found
+        return None
+
+    def get_company_size_category(market_cap):
+        """
+        Determine company size category based on market cap.
+        
+        Args:
+            market_cap (float): Company's market capitalization
+        
+        Returns:
+            str: Company size category
+        """
+        if market_cap > 1e12:  # Over $1 trillion
+            return "Mega Cap"
+        elif market_cap > 1e11:  # Over $100 billion
+            return "Large Cap"
+        elif market_cap > 1e10:  # Over $10 billion
+            return "Mid Cap"
+        elif market_cap > 1e9:  # Over $1 billion
+            return "Small Cap"
+        elif market_cap > 0:  # Any positive value
+            return "Micro Cap"
+        else:
+            return "Unknown"
+
+    def get_max_growth_cap(market_cap):
+        """
+        Get maximum growth cap based on company size.
+        
+        Args:
+            market_cap (float): Company's market capitalization
+        
+        Returns:
+            float: Maximum growth cap
+        """
+        if market_cap > 1e12:  # Over $1 trillion
+            return 0.10  # Cap at 10%
+        elif market_cap > 1e11:  # Over $100 billion
+            return 0.15  # Cap at 15%
+        elif market_cap > 1e10:  # Over $10 billion
+            return 0.20  # Cap at 20%
+        elif market_cap > 1e9:  # Over $1 billion
+            return 0.25  # Cap at 25%
+        else:
+            return 0.30  # Cap at 30% for smaller companies
+        
+    ####################################################################################################################################################
+    ####################################################################################################################################################
+    ####################################################################################################################################################
+    ####################################################################################################################################################
+    ####################################################################################################################################################
+    
+    #------------------ Edit this, the Terminal Value Calculation Functions ------------------#
+    
+    def calculate_terminal_value(final_year_fcf, short_term_growth, wacc, ticker, years_projection=10):
+        # Validate inputs
+        if np.isnan(wacc) or wacc <= 0:
+            print(f"Invalid WACC: {wacc}, using default 9%")
+            wacc = 0.09
+        
+        if np.isnan(short_term_growth):
+            print(f"Invalid growth rate, using default 3%")
+            short_term_growth = 0.03
+        
+        # Get company information for better terminal growth estimation
+        try:
+            stock = yf.Ticker(ticker)
+            market_cap = stock.info.get('marketCap', 0)
+            sector = stock.info.get('sector', '')
+        except:
+            market_cap = 0
+            sector = ''
+        
+        # Set long-term growth rate based on company size and sector
+        # Large caps should revert closer to GDP growth in terminal value
+        if market_cap > 1e12:  # Over $1 trillion
+            long_term_gdp_growth = 0.02  # ~2% for mega caps
+        elif market_cap > 1e11:  # Over $100 billion
+            long_term_gdp_growth = 0.025  # ~2.5% for large caps
+        else:
+            long_term_gdp_growth = 0.03  # ~3% for smaller companies
+        
+        # Adjust based on sector dynamics (technology can sustain higher growth)
+        if sector.lower() in ['technology', 'information technology']:
+            long_term_gdp_growth += 0.005  # Add 0.5% for tech
+        elif sector.lower() in ['utilities', 'consumer staples']:
+            long_term_gdp_growth -= 0.005  # Subtract 0.5% for slow-growth sectors
+        
+        # Create a more gradual transition from short-term to long-term growth
+        growth_rates = []
+        for year in range(1, years_projection + 1):
+            if year <= 5:
+                # First 5 years: Use short-term growth
+                growth_rates.append(short_term_growth)
+            else:
+                # Years 6-10: Linear transition to long-term growth
+                transition_factor = (year - 5) / 5  # 0 at year 5, 1 at year 10
+                growth_rate = short_term_growth - (transition_factor * (short_term_growth - long_term_gdp_growth))
+                growth_rates.append(growth_rate)
+        
+        # Calculate FCF for each year with varying growth rates
+        projected_fcfs = [final_year_fcf]
+        for rate in growth_rates:
+            projected_fcfs.append(projected_fcfs[-1] * (1 + rate))
+        
+        # Remove the initial FCF (it's the actual last year, not projected)
+        projected_fcfs = projected_fcfs[1:]
+        
+        # Calculate PV of explicit period FCFs
+        pv_fcfs = []
+        for year, fcf in enumerate(projected_fcfs, start=1):
+            pv_fcf = fcf / ((1 + wacc) ** year)
+            pv_fcfs.append(pv_fcf)
+        
+        # Ensure the terminal growth rate is less than WACC (required for Gordon Growth Model)
+        if long_term_gdp_growth >= wacc:
+            print(f"Terminal growth rate {long_term_gdp_growth:.2%} must be less than WACC {wacc:.2%}")
+            long_term_gdp_growth = wacc - 0.01  # Set growth 1% below WACC
+        
+        # Terminal value using Gordon Growth Model with long-term growth rate
+        terminal_value = projected_fcfs[-1] * (1 + long_term_gdp_growth) / (wacc - long_term_gdp_growth)
+        pv_terminal_value = terminal_value / ((1 + wacc) ** years_projection)
+        
+        return {
+            'projected_fcfs': projected_fcfs,
+            'pv_fcfs': pv_fcfs,
+            'terminal_value': terminal_value,
+            'pv_terminal_value': pv_terminal_value,
+            'growth_rates': growth_rates,
+            'total_dcf_value': sum(pv_fcfs) + pv_terminal_value
+        }
+    
+    ##############################################################################
+    ##############################################################################
+    ##############################################################################
+
+    #----- Visualizing Confidence Interval with Monte Carlo Simulation -------#
+    # Implements a Monte Carlo simulationt to account for uncertainty in the estimates  
+
+    #----------- Try 2: new iteration, works with try 2-------------------#
+
+    # Modify the sensitivity analysis in the main function to handle NaN values
+    def perform_advanced_dcf_analysis(ticker, cik):
+        # Get financial data
+        financial_data = get_financial_data(ticker, cik)
+        
+        if not financial_data:
+            return None
+        
+        # Calculate WACC (Discount Rate)
+        wacc_data = calculate_wacc(ticker)
+        discount_rate = wacc_data['wacc']
+        
+        # Calculate Growth Rates
+        growth_data = calculate_growth_rates(ticker, cik)
+        growth_rate = growth_data['short_term_growth']
+        
+        # Get FCF and shares outstanding
+        free_cash_flow = financial_data['free_cash_flow']
+        shares_outstanding = financial_data['shares_outstanding']
+        current_price = financial_data['current_price']
+        
+        # Calculate Terminal Value and DCF
+        terminal_data = calculate_terminal_value(free_cash_flow, growth_rate, discount_rate, ticker)
+        
+        # Calculate intrinsic value per share
+        intrinsic_value_per_share = terminal_data['total_dcf_value'] / shares_outstanding
+        
+        # Determine valuation
+        if not np.isnan(intrinsic_value_per_share) and not np.isnan(current_price) and current_price > 0:
+            valuation_gap = (intrinsic_value_per_share / current_price - 1) * 100
+            is_undervalued = intrinsic_value_per_share > current_price
+        else:
+            valuation_gap = np.nan
+            is_undervalued = None
+        
+        # Prepare results
+        results = {
+            'ticker': ticker,
+            'fcf': free_cash_flow,
+            'shares_outstanding': shares_outstanding,
+            'current_price': current_price,
+            'discount_rate': discount_rate,
+            'growth_rate': growth_rate,
+            'dcf_value': terminal_data['total_dcf_value'],
+            'intrinsic_value': intrinsic_value_per_share,
+            'valuation_gap': valuation_gap,
+            'is_undervalued': is_undervalued,
+            'detailed_growth': growth_data,
+            'detailed_wacc': wacc_data,
+            'detailed_projections': terminal_data
+        }
+        
+        return results
+
+    # Get the financial data
+    financial_data = get_financial_data(ticker, company_cik)
+
+    if financial_data:
+        print(f"\n--- DCF Valuation for {ticker} ---")
+        # print("Calculating detailed DCF using advanced estimator...")
+        
+        # Use the advanced DCF analysis function from domestic_rate_estimator.py
+        dcf_results = perform_advanced_dcf_analysis(ticker, company_cik)
+        # print(f"KEY: dcf_results: {dcf_results}")
+
+        
+        if dcf_results:
+            # Extract key values from results
+            free_cash_flow = dcf_results['fcf']
+            shares_outstanding = dcf_results['shares_outstanding']
+            current_price = dcf_results['current_price']
+            discount_rate = dcf_results['discount_rate']
+            growth_rate = dcf_results['growth_rate']
+            total_dcf = dcf_results['dcf_value']
+            intrinsic_value_per_share = dcf_results['intrinsic_value']
+            valuation_gap = dcf_results['valuation_gap']
+            
+            # Detailed components
+            wacc_details = dcf_results['detailed_wacc']
+            growth_details = dcf_results['detailed_growth']
+            projection_details = dcf_results['detailed_projections']
+            
+            # Get the projected FCFs and present values
+            projected_fcfs = projection_details['projected_fcfs']
+            pv_fcfs = projection_details['pv_fcfs']
+            terminal_value = projection_details['terminal_value']
+            pv_terminal_value = projection_details['pv_terminal_value']
+            years = len(projected_fcfs)
+            
+            # Print detailed results
+            print(f"\n--- DCF Valuation Results for {ticker} ---")
+            print(f"Free Cash Flow (Latest): ${free_cash_flow:,.2f}")
+            print(f"WACC (Discount Rate): {discount_rate:.2%}")
+            print(f"Projected Growth Rate: {growth_rate:.2%}")
+            
+            # Print WACC components
+            print("\n--- WACC Components ---")
+            print(f"Cost of Equity: {wacc_details['cost_of_equity']:.2%}")
+            print(f"After-tax Cost of Debt: {wacc_details['after_tax_cost_of_debt']:.2%}")
+            print(f"Debt Weight: {wacc_details['weight_debt']:.2%}")
+            print(f"Equity Weight: {wacc_details['weight_equity']:.2%}")
+            print(f"Beta: {wacc_details['beta']:.2f}")
+            
+            # Print Growth Components
+            print("\n--- Growth Rate Components ---")
+            if growth_details['historical_fcf_growth'] is not None:
+                print(f"Historical FCF Growth: {growth_details['historical_fcf_growth']:.2%}")
+            if growth_details['revenue_growth'] is not None:
+                print(f"Historical Revenue Growth: {growth_details['revenue_growth']:.2%}")
+            if growth_details['analyst_estimate'] is not None:
+                print(f"Analyst Growth Estimate: {growth_details['analyst_estimate']:.2%}")
+            if growth_details['regression_growth'] is not None:
+                print(f"Regression-based Growth: {growth_details['regression_growth']:.2%}")
+            
+            # Print FCF Projections
+            print("\n--- FCF Projections ---")
+            growth_rates = projection_details['growth_rates']
+            for i, (fcf, pv, rate) in enumerate(zip(projected_fcfs, pv_fcfs, growth_rates), start=1):
+                print(f"Year {i}: FCF ${fcf:,.2f} (Growth: {rate:.2%}, PV: ${pv:,.2f})")
+            
+            # Print DCF Valuation Summary
+            print(f"\nPresent Value of Future FCF: ${sum(pv_fcfs):,.2f}")
+            print(f"Terminal Value: ${terminal_value:,.2f}")
+            print(f"Present Value of Terminal Value: ${pv_terminal_value:,.2f}")
+            print(f"Total DCF Value: ${total_dcf:,.2f}")
+            print(f"Shares Outstanding: {shares_outstanding:,}")
+            print(f"Intrinsic Value per Share: ${intrinsic_value_per_share:.2f}")
+            print(f"Current Market Price: ${current_price:.2f}")
+            
+            # Determine if the stock is under or overvalued
+            if intrinsic_value_per_share > current_price:
+                print(f"✅ {ticker} is UNDERVALUED by {valuation_gap:.2f}%")
+            else:
+                print(f"⚠️ {ticker} is OVERVALUED by {abs(valuation_gap):.2f}%")
+            
+            # Sensitivity analysis - using discount and growth rates from estimator
+            print("\n--- Sensitivity Analysis ---")
+            base_discount = discount_rate
+            base_growth = growth_rate
+            
+            # Create ranges around the calculated rates
+            discount_ranges = [
+                max(0.04, base_discount - 0.02),
+                max(0.05, base_discount - 0.01),
+                base_discount,
+                base_discount + 0.01,
+                base_discount + 0.02
+            ]
+            
+            growth_ranges = [
+                max(0.01, base_growth - 0.015),
+                max(0.015, base_growth - 0.0075),
+                base_growth,
+                base_growth + 0.0075,
+                base_growth + 0.015
+            ]
+            
+            sensitivity_results = []
+            
+            for d_rate in discount_ranges:
+                row = []
+                for g_rate in growth_ranges:
+                    # Use the terminal value calculation function for consistent methodology
+                    tv_data = calculate_terminal_value(free_cash_flow, g_rate, d_rate, ticker)
+                    value_per_share = tv_data['total_dcf_value'] / shares_outstanding
+                    row.append(value_per_share)
+                sensitivity_results.append(row)
+            
+            # Create a DataFrame for better visualization
+            sensitivity_df = pd.DataFrame(sensitivity_results, 
+                                        index=[f"Discount {d*100:.1f}%" for d in discount_ranges],
+                                        columns=[f"Growth {g*100:.1f}%" for g in growth_ranges])
+            
+            print("\nIntrinsic Value per Share Sensitivity Table:")
+            print(sensitivity_df)
+            
+        else:
+            print("Advanced DCF analysis failed. Check for errors in the estimator functions.")
+    else:
+        print("Unable to retrieve required financial data to perform DCF analysis.")
+"""
+Fetching financial data for AAPL...
+
+--- DCF Valuation for AAPL ---
+
+Fetching financial data for AAPL...
+Calculating WACC for AAPL...
+Using standard corporate tax rate
+Calculating growth rates for AAPL...
+Calculating default growth values for AAPL...
+Adjusted default growth for AAPL based on company characteristics: 11.00%
+Error in regression calculation: loop of ufunc does not support argument 0 of type float which has no callable log method
+
+--- DCF Valuation Results for AAPL ---
+Free Cash Flow (Latest): $108,807,000,000.00
+WACC (Discount Rate): 9.91%
+Projected Growth Rate: 6.43%
+
+--- WACC Components ---
+Cost of Equity: 10.20%
+After-tax Cost of Debt: 4.90%
+Debt Weight: 5.55%
+Equity Weight: 94.45%
+Beta: 1.20
+
+--- Growth Rate Components ---
+Historical FCF Growth: 6.17%
+Historical Revenue Growth: 2.34%
+Analyst Growth Estimate: 10.10%
+
+--- FCF Projections ---
+Year 1: FCF $115,803,685,361.73 (Growth: 6.43%, PV: $105,366,586,069.10)
+Year 2: FCF $123,250,283,008.99 (Growth: 6.43%, PV: $102,034,956,021.73)
+Year 3: FCF $131,175,723,936.12 (Growth: 6.43%, PV: $98,808,670,174.90) 
+Year 4: FCF $139,610,799,505.52 (Growth: 6.43%, PV: $95,684,397,606.37)
+Year 5: FCF $148,588,281,076.00 (Growth: 6.43%, PV: $92,658,912,715.74)
+Year 6: FCF $156,975,035,479.66 (Growth: 5.64%, PV: $89,066,371,377.08)
+Year 7: FCF $164,601,224,847.93 (Growth: 4.86%, PV: $84,976,093,155.10)
+Year 8: FCF $171,304,025,901.61 (Growth: 4.07%, PV: $80,465,885,599.18)
+Year 9: FCF $176,933,200,651.50 (Growth: 3.29%, PV: $75,619,549,859.33)
+Year 10: FCF $181,356,530,667.79 (Growth: 2.50%, PV: $70,524,250,834.22)
+
+Present Value of Future FCF: $895,205,673,412.73
+Terminal Value: $2,510,163,465,621.68
+Present Value of Terminal Value: $976,129,159,686.43
+Total DCF Value: $1,871,334,833,099.16
+Shares Outstanding: 15,022,100,480
+Intrinsic Value per Share: $124.57
+Current Market Price: $241.84
+⚠️ AAPL is OVERVALUED by 48.49%
+"""
