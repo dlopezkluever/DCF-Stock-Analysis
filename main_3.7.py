@@ -1,7 +1,6 @@
-# most complex, like main 3_1.py
-# Where it builds off #ain_4.py (2.27) progress, making the new revamped functions seen in 3_1, but with the full implementation
-# that uses a OOP for the Financial Data Acquisition implemetation and runs with the use of a main loop
-
+#To Toogle the Monte Carlo Simulation, go to line 3450
+#To Edit iteration count of Monte Carlo Simulation, go to line 3451
+#Create an .env file to store your API keys (line 44-46)  
 
 import os
 import numpy as np
